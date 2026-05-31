@@ -1,0 +1,45 @@
+{
+  "name": "voxlink",
+  "version": "1.0.0",
+  "description": "Local network voice chat with screen sharing",
+  "main": "src/main.js",
+  "author": "voxlink",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/local/voxlink"
+  },
+  "scripts": {
+    "start": "electron .",
+    "build:linux": "electron-builder --linux AppImage",
+    "build:deb": "electron-builder --linux deb",
+    "build:win": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.voxlink.app",
+    "productName": "VoxLink",
+    "publish": null,
+    "files": [
+      "src/**/*",
+      "public/**/*"
+    ],
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Network",
+      "executableName": "voxlink"
+    },
+    "win": {
+      "target": ["nsis"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}
