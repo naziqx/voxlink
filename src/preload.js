@@ -7,3 +7,14 @@ contextBridge.exposeInMainWorld('voxlink', {
   getScreenSources:   ()            => ipcRenderer.invoke('get-screen-sources'),
   showNotification:   (opts)        => ipcRenderer.invoke('show-notification', opts),
 });
+
+// expose loopback control
+const { ipcRenderer: ipc2 } = require('electron');
+contextBridge.exposeInMainWorld('audioLoopback', {
+  enable: () => ipc2.invoke('enable-loopback'),
+});
+
+contextBridge.exposeInMainWorld('pipewire', {
+  start: () => ipc2.invoke('pipewire-start'),
+  stop:  () => ipc2.invoke('pipewire-stop'),
+});

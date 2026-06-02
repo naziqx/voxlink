@@ -23,12 +23,16 @@
       "public/**/*"
     ],
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "category": "Network",
       "executableName": "voxlink"
     },
     "win": {
-      "target": ["nsis"]
+      "target": [
+        "nsis"
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -36,6 +40,7 @@
     }
   },
   "dependencies": {
+    "electron-audio-loopback": "^1.0.6",
     "ws": "^8.18.0"
   },
   "devDependencies": {

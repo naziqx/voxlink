@@ -250,7 +250,12 @@ async function handleSignal(msg) {
     }
 
     case 'screen_start': {
-      // Nothing to do - with headphones there's no audio feedback loop
+      const peer = peers.get(msg.from);
+      if (peer) {
+        peer.screenAudioStreamId = msg.audioStreamId;
+        peer.screenAudioTrackId = msg.audioTrackId;
+        console.log('[voxlink] screen_start from', msg.from, 'streamId:', msg.audioStreamId, 'trackId:', msg.audioTrackId);
+      }
       break;
     }
 
@@ -324,21 +329,64 @@ function createPC(peerId) {
     console.log('[voxlink] ontrack from', peerId, 'kind:', track.kind, 'streams:', e.streams.length);
 
     if (track.kind === 'video') {
-      // Screen share video (+ possibly audio in same stream)
+      // Screen share video
       peer.sharingScreen = true;
       peer.screenStream = stream;
       renderPeers();
       updateCardLabel(peerId);
       showSharedScreen(stream, peer.name, peerId);
+
+      // Apply any buffered screen audio tracks that arrived before video
+      if (peer.pendingScreenAudio) {
+        peer.pendingScreenAudio.forEach(audioTrack => {
+          console.log('[voxlink] applying buffered screen audio track');
+          stream.addTrack(audioTrack);
+        });
+        peer.pendingScreenAudio = null;
+        // Reassign srcObject so video element picks up new audio track
+        const video = document.getElementById('share-video');
+        if (video) {
+          const wasMuted = video.muted;
+          video.srcObject = stream;
+          video.muted = wasMuted;
+          video.play().catch(e => console.warn('[voxlink] video play failed:', e.message));
+          console.log('[voxlink] video srcObject reassigned with audio');
+        }
+      }
     } else {
-      // Audio track — could be mic or screen share audio
-      // If this stream also has video tracks it's screen audio — video el handles it
-      // If pure audio stream — it's the mic
-      if (stream.getVideoTracks().length > 0) {
-        // Screen share audio — already handled by the video element
-        console.log('[voxlink] screen audio track received, handled by video element');
+      // Audio track — check if it belongs to screen stream (same stream id)
+      // or is a mic stream (different stream id)
+      console.log('[voxlink] audio track stream id:', stream.id, 'screenAudioStreamId:', peer.screenAudioStreamId);
+
+      // Identify screen audio by stream id sent in screen_start signal
+      // Match by track ID (most reliable) or stream ID
+      const isScreenAudio = 
+        (peer.screenAudioTrackId && track.id === peer.screenAudioTrackId) ||
+        (peer.screenAudioStreamId && stream.id === peer.screenAudioStreamId);
+      console.log('[voxlink] isScreenAudio:', isScreenAudio, 'track.id:', track.id, 'expected:', peer.screenAudioTrackId);
+
+      if (isScreenAudio) {
+        if (peer.screenStream) {
+          // Video already arrived — add audio track and reassign srcObject
+          console.log('[voxlink] screen audio added after video');
+          peer.screenStream.addTrack(track);
+          const video = document.getElementById('share-video');
+          if (video) {
+            const wasMuted = video.muted;
+            video.srcObject = peer.screenStream;
+            video.muted = wasMuted;
+            video.play().catch(e => console.warn('[voxlink] video play failed:', e.message));
+            console.log('[voxlink] video srcObject reassigned');
+          }
+        } else {
+          // Video not arrived yet — buffer
+          if (!peer.pendingScreenAudio) peer.pendingScreenAudio = [];
+          peer.pendingScreenAudio.push(track);
+          console.log('[voxlink] screen audio buffered (waiting for video)');
+        }
         return;
       }
+
       // Mic audio stream
       peer.stream = stream;
       if (!peer.audioEl) {
@@ -708,55 +756,106 @@ function setContentHint(stream) {
 
 async function startScreenShare(sourceId, shareAudio = false) {
   // Don't mute peers on the sharer's side - sharer should hear everyone
-  // Viewers will mute peer audio themselves via screen_start signal
 
   try {
-    // Try modern getDisplayMedia first (supports audio on Windows natively)
-    // On Linux/Wayland with PipeWire it also works via xdg-desktop-portal
-    // suppressLocalAudioPlayback: captured audio is NOT played in host's headphones
-    // This breaks the echo loop: audio plays to viewers only, not back into capture
-    const audioConstraints = shareAudio ? {
-      echoCancellation: false,
-      noiseSuppression: false,
-      sampleRate: 48000,
-      suppressLocalAudioPlayback: true,
-    } : false;
-
-    screenStream = await navigator.mediaDevices.getDisplayMedia({
+    // Step 1: get video via Electron desktopCapturer (our custom picker sourceId)
+    const videoStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
       video: {
-        width: { ideal: 1920, max: 1920 },
-        height: { ideal: 1080, max: 1080 },
-        frameRate: { ideal: 30, max: 30 },
-        displaySurface: 'monitor',
-      },
-      audio: audioConstraints,
-      selfBrowserSurface: 'exclude',
-    });
-    const audioTracks = screenStream.getAudioTracks();
-    console.log('[voxlink] screen audio tracks:', audioTracks.length, audioTracks.map(t => t.label));
-  } catch (e) {
-    console.warn('[voxlink] getDisplayMedia failed, falling back to getUserMedia:', e.message);
-    // Fallback: getUserMedia with desktopCapturer sourceId (Electron classic way)
-    try {
-      screenStream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: sourceId,
-            minWidth: 1280,
-            maxWidth: 1920,
-            minHeight: 720,
-            maxHeight: 1080,
-            minFrameRate: 15,
-            maxFrameRate: 30,
-          }
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: sourceId,
+          minWidth: 1280,
+          maxWidth: 1920,
+          minHeight: 720,
+          maxHeight: 1080,
+          minFrameRate: 15,
+          maxFrameRate: 30,
         }
-      });
-    } catch (e2) {
-      alert('Screen capture failed: ' + e2.message);
-      return;
+      }
+    });
+
+    if (shareAudio) {
+      const isLinux = navigator.userAgent.includes('Linux');
+      let audioStream = null;
+
+      if (isLinux && window.pipewire) {
+        // Linux: use PipeWire virtual sink to capture system audio excluding our app
+        try {
+          const pw = await window.pipewire.start();
+          if (pw.ok) {
+            console.log('[voxlink] PipeWire sink ready:', pw.sinkName);
+
+            // Wait for PipeWire to register the monitor as audio input device
+            await new Promise(r => setTimeout(r, 500));
+
+            // Find voxlink_capture.monitor in audio input devices
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const monitorDevice = devices.find(d =>
+              d.kind === 'audioinput' && d.label.toLowerCase().includes('voxlink')
+            );
+            console.log('[voxlink] monitor device:', monitorDevice?.label, monitorDevice?.deviceId);
+
+            // Look for voxlink_mic virtual source
+            const micDevice = devices.find(d =>
+              d.kind === 'audioinput' && d.label.toLowerCase().includes('voxlink')
+            );
+            console.log('[voxlink] mic device:', micDevice?.label, micDevice?.deviceId);
+
+            if (micDevice) {
+              const pwStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  deviceId: { exact: micDevice.deviceId },
+                  echoCancellation: false,
+                  noiseSuppression: false,
+                  autoGainControl: false,
+                },
+                video: false,
+              }).catch(e => { console.warn('[voxlink] voxlink_mic capture failed:', e.message); return null; });
+
+              if (pwStream) {
+                audioStream = pwStream;
+                console.log('[voxlink] voxlink_mic captured, tracks:', pwStream.getAudioTracks().length);
+              }
+            } else {
+              console.warn('[voxlink] voxlink_mic not found in devices');
+            }
+          }
+        } catch(e) {
+          console.warn('[voxlink] PipeWire setup failed:', e.message);
+        }
+      } else if (window.audioLoopback) {
+        // Windows: use electron-audio-loopback
+        try {
+          await window.audioLoopback.enable();
+          const loopbackStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: true,
+          });
+          loopbackStream.getVideoTracks().forEach(t => { t.stop(); loopbackStream.removeTrack(t); });
+          audioStream = loopbackStream;
+          console.log('[voxlink] Windows loopback audio tracks:', loopbackStream.getAudioTracks().length);
+        } catch(e) {
+          console.warn('[voxlink] Windows loopback failed:', e.message);
+        }
+      }
+
+      if (audioStream && audioStream.getAudioTracks().length > 0) {
+        screenStream = new MediaStream([
+          ...videoStream.getVideoTracks(),
+          ...audioStream.getAudioTracks(),
+        ]);
+      } else {
+        console.warn('[voxlink] no audio captured, video only');
+        screenStream = videoStream;
+      }
+    } else {
+      screenStream = videoStream;
     }
+
+  } catch (e) {
+    alert('Screen capture failed: ' + e.message);
+    return;
   }
   if (screenStream.getAudioTracks().length > 0) {
     console.log('[voxlink] system audio will be shared');
@@ -798,16 +897,29 @@ async function startScreenShare(sourceId, shareAudio = false) {
   shareViewer.style.display = 'flex';
   document.getElementById('voice-grid').style.display = 'none';
 
-  // Add all tracks (video + system audio on Windows) to peer connections
+  // Send screen_start BEFORE renegotiate so viewers store audioStreamId before ontrack fires
+  const screenAudioTrack = screenStream.getAudioTracks()[0];
+  console.log('[voxlink] screenStream.id:', screenStream.id, 'audio track id:', screenAudioTrack?.id);
+  console.log('[voxlink] all stream tracks:', screenStream.getTracks().map(t => t.kind + ':' + t.id));
+  send({ 
+    type: 'screen_start', 
+    hasAudio: !!screenAudioTrack,
+    audioStreamId: screenAudioTrack ? screenStream.id : null,
+    audioTrackId: screenAudioTrack ? screenAudioTrack.id : null,
+  });
+
+  // Small delay to let screen_start arrive before tracks
+  await new Promise(r => setTimeout(r, 100));
+
+  // Add all tracks (video + system audio) to peer connections
+  const screenTracks = screenStream.getTracks();
+  console.log('[voxlink] adding tracks to peers:', screenTracks.map(t => t.kind + ':' + t.label));
   peers.forEach(peer => {
     if (peer.pc) {
-      screenStream.getTracks().forEach(track => peer.pc.addTrack(track, screenStream));
+      screenTracks.forEach(track => peer.pc.addTrack(track, screenStream));
       renegotiate(peer.pc, peer);
     }
   });
-
-  // Notify viewers: screen share started with/without audio so they can mute accordingly
-  send({ type: 'screen_start', hasAudio: screenStream.getAudioTracks().length > 0 });
 
   // Force high bitrate after renegotiation settles (try twice for reliability)
   setTimeout(() => forceHighBitrate(), 1000);
@@ -834,6 +946,11 @@ async function stopScreenShare() {
 
   screenStream?.getTracks().forEach(t => t.stop());
   screenStream = null;
+
+  // Teardown PipeWire virtual sink on Linux
+  if (window.pipewire) {
+    window.pipewire.stop().catch(e => console.warn('[voxlink] pipewire stop:', e.message));
+  }
 
   // Restore peer audio in case deafen was on
   peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = isDeafened; });
@@ -933,10 +1050,8 @@ function showSharedScreen(stream, peerName, peerId) {
   const video = document.getElementById('share-video');
   video.muted = true;
   video.srcObject = stream;
-
-  // No muting needed - headphones prevent audio feedback
-
   video.muted = false;
+  video.play().catch(e => console.warn('[voxlink] play failed:', e.message));
   document.getElementById('share-bar-label').textContent = `🖥 ${peerName} is sharing their screen`;
   document.getElementById('share-viewer').style.display = 'flex';
   document.getElementById('voice-grid').style.display = 'none';
