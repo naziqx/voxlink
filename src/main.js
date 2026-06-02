@@ -95,7 +95,8 @@ function getLocalIPs() {
 function startSignalingServer(port) {
   return new Promise((resolve, reject) => {
     if (signalingServer) {
-      resolve({ port, ips: getLocalIPs() });
+      // Already hosting — return error so UI can show message
+      reject(new Error(`Already hosting on port ${port}. Stop current session first.`));
       return;
     }
 
@@ -122,6 +123,19 @@ function startSignalingServer(port) {
             meta.name = (msg.name || 'User').slice(0, 32);
             meta.room = msg.room || 'default';
 
+            // Check if same name already in room (double-connect guard)
+            let duplicate = false;
+            clients.forEach((m, pws) => {
+              if (pws !== ws && m.room === meta.room && m.name === meta.name) {
+                duplicate = true;
+              }
+            });
+            if (duplicate) {
+              ws.send(JSON.stringify({ type: 'error', message: `Name "${meta.name}" is already in this room` }));
+              ws.close();
+              break;
+            }
+
             // Collect existing peers in same room
             const peers = [];
             clients.forEach((m, pws) => {
@@ -135,6 +149,7 @@ function startSignalingServer(port) {
 
             // Notify others
             broadcast(meta.room, { type: 'peer_joined', id: clientId, name: meta.name }, ws, clients);
+            console.log(`[+] ${meta.name} (${clientId}) joined. Room members: ${peers.length + 1}`);
             break;
           }
 
@@ -151,6 +166,11 @@ function startSignalingServer(port) {
 
           case 'mute': {
             broadcast(meta.room, { type: 'mute', from: meta.id, muted: msg.muted }, ws, clients);
+            break;
+          }
+
+          case 'screen_start': {
+            broadcast(meta.room, { type: 'screen_start', from: meta.id, hasAudio: msg.hasAudio }, ws, clients);
             break;
           }
 

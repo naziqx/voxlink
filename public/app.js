@@ -208,6 +208,18 @@ async function enterRoom(name, wsUrl, hosting) {
 // ── Signaling ─────────────────────────────────────────────────────────────────
 async function handleSignal(msg) {
   switch (msg.type) {
+    case 'error': {
+      // Server rejected connection
+      ws?.close();
+      localStream?.getTracks().forEach(t => t.stop());
+      localStream = null;
+      isConnecting = false;
+      myId = null;
+      setError(msg.message || 'Connection rejected by server');
+      showScreen('screen-connect');
+      break;
+    }
+
     case 'joined': {
       myId = msg.id;
       showRoomUI();
@@ -234,6 +246,11 @@ async function handleSignal(msg) {
       renderPeers();
       addVoiceCard(msg.id, null); // remove card
       notify(`${msg.name} left`);
+      break;
+    }
+
+    case 'screen_start': {
+      // Nothing to do - with headphones there's no audio feedback loop
       break;
     }
 
@@ -672,10 +689,10 @@ function closeModal() { document.getElementById('modal-screen').style.display = 
 
 document.getElementById('modal-share').addEventListener('click', async () => {
   if (!selectedSourceId) return;
-  // Store selected source so setDisplayMediaRequestHandler can use it
   window._selectedSourceId = selectedSourceId;
+  const shareAudio = document.getElementById('chk-share-audio').checked;
   closeModal();
-  await startScreenShare(selectedSourceId);
+  await startScreenShare(selectedSourceId, shareAudio);
 });
 
 function setContentHint(stream) {
@@ -689,10 +706,22 @@ function setContentHint(stream) {
   }
 }
 
-async function startScreenShare(sourceId) {
+async function startScreenShare(sourceId, shareAudio = false) {
+  // Don't mute peers on the sharer's side - sharer should hear everyone
+  // Viewers will mute peer audio themselves via screen_start signal
+
   try {
     // Try modern getDisplayMedia first (supports audio on Windows natively)
     // On Linux/Wayland with PipeWire it also works via xdg-desktop-portal
+    // suppressLocalAudioPlayback: captured audio is NOT played in host's headphones
+    // This breaks the echo loop: audio plays to viewers only, not back into capture
+    const audioConstraints = shareAudio ? {
+      echoCancellation: false,
+      noiseSuppression: false,
+      sampleRate: 48000,
+      suppressLocalAudioPlayback: true,
+    } : false;
+
     screenStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         width: { ideal: 1920, max: 1920 },
@@ -700,11 +729,7 @@ async function startScreenShare(sourceId) {
         frameRate: { ideal: 30, max: 30 },
         displaySurface: 'monitor',
       },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        sampleRate: 48000,
-      },
+      audio: audioConstraints,
       selfBrowserSurface: 'exclude',
     });
     const audioTracks = screenStream.getAudioTracks();
@@ -735,6 +760,11 @@ async function startScreenShare(sourceId) {
   }
   if (screenStream.getAudioTracks().length > 0) {
     console.log('[voxlink] system audio will be shared');
+    // Keep peers muted - their voice comes through screen audio
+  } else {
+    // No screen audio - restore peer mic audio immediately
+    console.log('[voxlink] no screen audio, restoring peer audio');
+    peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = isDeafened; });
   }
     // Tell encoder this is screen content (sharp text), not motion video
     setContentHint(screenStream);
@@ -776,6 +806,9 @@ async function startScreenShare(sourceId) {
     }
   });
 
+  // Notify viewers: screen share started with/without audio so they can mute accordingly
+  send({ type: 'screen_start', hasAudio: screenStream.getAudioTracks().length > 0 });
+
   // Force high bitrate after renegotiation settles (try twice for reliability)
   setTimeout(() => forceHighBitrate(), 1000);
   setTimeout(() => forceHighBitrate(), 3000);
@@ -793,7 +826,6 @@ async function stopScreenShare() {
     if (!peer.pc) return;
     peer.pc.getSenders().forEach(sender => {
       if (!sender.track) return;
-      // Remove video tracks and any audio tracks that came from screenStream
       if (sender.track.kind === 'video') {
         try { peer.pc.removeTrack(sender); } catch (e) {}
       }
@@ -802,6 +834,9 @@ async function stopScreenShare() {
 
   screenStream?.getTracks().forEach(t => t.stop());
   screenStream = null;
+
+  // Restore peer audio in case deafen was on
+  peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = isDeafened; });
 
   document.getElementById('ctrl-screen').classList.remove('active');
   document.getElementById('share-viewer').style.display = 'none';
@@ -899,14 +934,7 @@ function showSharedScreen(stream, peerName, peerId) {
   video.muted = true;
   video.srcObject = stream;
 
-  const hasScreenAudio = stream.getAudioTracks().length > 0;
-  if (hasScreenAudio) {
-    // Mute all peer mic audio to avoid hearing them twice
-    // (their voice comes through screen audio capture already)
-    peers.forEach(peer => {
-      if (peer.audioEl) peer.audioEl.muted = true;
-    });
-  }
+  // No muting needed - headphones prevent audio feedback
 
   video.muted = false;
   document.getElementById('share-bar-label').textContent = `🖥 ${peerName} is sharing their screen`;

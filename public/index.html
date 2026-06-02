@@ -144,8 +144,15 @@
     </div>
     <div class="source-grid" id="source-grid"></div>
     <div class="modal-footer">
-      <button class="btn-secondary" id="modal-cancel">Cancel</button>
-      <button class="btn-primary" id="modal-share" disabled>Share</button>
+      <label class="audio-toggle">
+        <input type="checkbox" id="chk-share-audio" checked />
+        <span>Share system audio</span>
+        <span class="audio-hint">(may cause echo without headphones)</span>
+      </label>
+      <div style="display:flex;gap:8px">
+        <button class="btn-secondary" id="modal-cancel">Cancel</button>
+        <button class="btn-primary" id="modal-share" disabled>Share</button>
+      </div>
     </div>
   </div>
 </div>
