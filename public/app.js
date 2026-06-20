@@ -18,7 +18,7 @@ let viewingPeerId = null; // which peer's screen we're currently watching
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 function initials(name) {
   return name.trim().slice(0, 2).toUpperCase() || '??';
@@ -110,7 +110,7 @@ async function doHost() {
   const name = document.getElementById('inp-name').value.trim();
   const port = parseInt(document.getElementById('inp-port-host').value) || 7842;
   if (!name) { setError('Enter your name'); return; }
-  setError('Staring server...');
+  setError('Starting server...');
 
   console.log('[voxlink] starting host on port', port);
   const result = await window.voxlink.startHost(port);
@@ -202,6 +202,10 @@ async function enterRoom(name, wsUrl, hosting) {
 
   ws.addEventListener('error', (e) => {
     console.error('[voxlink] ws runtime error');
+    // Close to trigger the 'close' handler which shows disconnected status
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
   });
 }
 
@@ -358,8 +362,8 @@ function createPC(peerId) {
       // or is a mic stream (different stream id)
       console.log('[voxlink] audio track stream id:', stream.id, 'screenAudioStreamId:', peer.screenAudioStreamId);
 
-      // Identify screen audio by stream id sent in screen_start signal
-      // Match by track ID (most reliable) or stream ID
+      // Identify screen audio: match by track id or stream id sent in screen_start signal.
+      // Note: _isScreenAudio and label checks don't cross WebRTC (receiver gets different objects).
       const isScreenAudio = 
         (peer.screenAudioTrackId && track.id === peer.screenAudioTrackId) ||
         (peer.screenAudioStreamId && stream.id === peer.screenAudioStreamId);
@@ -424,6 +428,10 @@ async function handleOffer(msg) {
   // RENEGOTIATION: reuse existing PC (e.g. screen share added)
   if (existingPeer?.pc) {
     try {
+      // Handle glary condition: both sides sent offer simultaneously
+      if (existingPeer.pc.signalingState === 'have-local-offer') {
+        await existingPeer.pc.setLocalDescription({ type: 'rollback' });
+      }
       await existingPeer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
       const answer = await existingPeer.pc.createAnswer();
       await existingPeer.pc.setLocalDescription(answer);
@@ -505,16 +513,18 @@ function startVolumeAnalyzer(id, stream) {
 // Also analyze local mic
 function startLocalAnalyzer() {
   if (!localStream) return;
+  if (audioCtxs.has('local')) return;
   const ctx = new AudioContext();
   const src = ctx.createMediaStreamSource(localStream);
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 512;
   src.connect(analyser);
+  audioCtxs.set('local', ctx);
   const data = new Uint8Array(analyser.frequencyBinCount);
 
   function tick() {
     const card = document.getElementById('vc-me');
-    if (!card) { ctx.close(); return; }
+    if (!card) { ctx.close(); audioCtxs.delete('local'); return; }
     analyser.getByteFrequencyData(data);
     const vol = data.reduce((a, b) => a + b, 0) / data.length / 255;
     const speaking = vol > 0.015 && !isMuted;
@@ -690,6 +700,9 @@ document.getElementById('ctrl-leave').addEventListener('click', async () => {
   peers.clear();
   localStream?.getTracks().forEach(t => t.stop());
   localStream = null;
+  // Cleanup all AudioContexts
+  audioCtxs.forEach((ctx, id) => { try { ctx.close(); } catch {} });
+  audioCtxs.clear();
   document.getElementById('voice-grid').innerHTML = '';
   document.getElementById('peers-list').innerHTML = '';
   showScreen('screen-connect');
@@ -789,18 +802,12 @@ async function startScreenShare(sourceId, shareAudio = false) {
             // Wait for PipeWire to register the monitor as audio input device
             await new Promise(r => setTimeout(r, 500));
 
-            // Find voxlink_capture.monitor in audio input devices
+            // Find voxlink_mic virtual source in audio input devices
             const devices = await navigator.mediaDevices.enumerateDevices();
-            const monitorDevice = devices.find(d =>
-              d.kind === 'audioinput' && d.label.toLowerCase().includes('voxlink')
-            );
-            console.log('[voxlink] monitor device:', monitorDevice?.label, monitorDevice?.deviceId);
-
-            // Look for voxlink_mic virtual source
             const micDevice = devices.find(d =>
               d.kind === 'audioinput' && d.label.toLowerCase().includes('voxlink')
             );
-            console.log('[voxlink] mic device:', micDevice?.label, micDevice?.deviceId);
+            console.log('[voxlink] voxlink_mic device:', micDevice?.label, micDevice?.deviceId);
 
             if (micDevice) {
               const pwStream = await navigator.mediaDevices.getUserMedia({
@@ -933,12 +940,12 @@ async function stopScreenShare() {
   if (!isSharingScreen) return;
   isSharingScreen = false;
 
-  // Remove screen video/audio senders from all PCs so we can addTrack again later
+  // Remove screen video+audio senders from all PCs so we can addTrack again later
+  const screenTracks = screenStream ? screenStream.getTracks() : [];
   peers.forEach(peer => {
     if (!peer.pc) return;
     peer.pc.getSenders().forEach(sender => {
-      if (!sender.track) return;
-      if (sender.track.kind === 'video') {
+      if (sender.track && screenTracks.includes(sender.track)) {
         try { peer.pc.removeTrack(sender); } catch (e) {}
       }
     });
@@ -949,7 +956,7 @@ async function stopScreenShare() {
 
   // Teardown PipeWire virtual sink on Linux
   if (window.pipewire) {
-    window.pipewire.stop().catch(e => console.warn('[voxlink] pipewire stop:', e.message));
+    await window.pipewire.stop().catch(e => console.warn('[voxlink] pipewire stop:', e.message));
   }
 
   // Restore peer audio in case deafen was on
@@ -1048,7 +1055,6 @@ document.getElementById('share-close').addEventListener('click', () => {
 function showSharedScreen(stream, peerName, peerId) {
   viewingPeerId = peerId || null;
   const video = document.getElementById('share-video');
-  video.muted = true;
   video.srcObject = stream;
   video.muted = false;
   video.play().catch(e => console.warn('[voxlink] play failed:', e.message));

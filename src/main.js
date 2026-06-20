@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, desktopCapturer, Notification } = require('electron');
 const { execSync, exec } = require('child_process');
 let audioLoopback = null;
+let audioLoopbackInitialized = false;
 try {
   audioLoopback = require('electron-audio-loopback');
 } catch(e) {
@@ -44,8 +45,10 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, '../public/index.html'));
 
-  // Open DevTools so you can see renderer errors
-  mainWindow.webContents.openDevTools({ mode: 'detach' });
+  // Open DevTools in development only
+  if (!app.isPackaged) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
 
   // Log renderer console to terminal
   mainWindow.webContents.on('console-message', (e, level, msg, line, src) => {
@@ -86,6 +89,7 @@ app.whenReady().then(() => {
   if (audioLoopback) {
     try {
       audioLoopback.initMain(app);
+      audioLoopbackInitialized = true;
       console.log('[main] electron-audio-loopback initialized');
     } catch(e) {
       console.warn('[main] audioLoopback init failed:', e.message);
@@ -97,6 +101,40 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   stopSignalingServer();
   if (process.platform !== 'darwin') app.quit();
+});
+
+// Cleanup PipeWire resources on unexpected exit
+function emergencyTeardownSync() {
+  if (pipewireMicModule || pipewireSinkModule) {
+    console.log('[pipewire] emergency teardown');
+    // Sync version — only for 'exit' event where async is impossible
+    if (pipewireMicModule) {
+      try { execSync(`pactl unload-module ${pipewireMicModule}`, { encoding: 'utf8', timeout: 3000 }); } catch {}
+      pipewireMicModule = null;
+    }
+    for (const { id, originalSink } of movedSinkInputs) {
+      try { execSync(`pactl move-sink-input ${id} ${originalSink}`, { encoding: 'utf8', timeout: 3000 }); } catch {}
+    }
+    movedSinkInputs = [];
+    if (pipewireSinkModule) {
+      try { execSync(`pactl unload-module ${pipewireSinkModule}`, { encoding: 'utf8', timeout: 3000 }); } catch {}
+      pipewireSinkModule = null;
+    }
+  }
+}
+async function emergencyTeardownAsync() {
+  if (pipewireMicModule || pipewireSinkModule) {
+    console.log('[pipewire] emergency teardown');
+    await teardownPipeWireCapture();
+  }
+}
+process.on('exit', emergencyTeardownSync);
+process.on('SIGINT', async () => { await emergencyTeardownAsync(); process.exit(0); });
+process.on('SIGTERM', async () => { await emergencyTeardownAsync(); process.exit(0); });
+process.on('uncaughtException', async (err) => {
+  console.error('[main] uncaught exception:', err);
+  await emergencyTeardownAsync();
+  process.exit(1);
 });
 
 // ── Signaling Server ──────────────────────────────────────────────────────────
@@ -264,8 +302,21 @@ function execCmd(cmd) {
   }
 }
 
-function parseSinkInputs() {
-  const out = execCmd('pactl list sink-inputs');
+function execCmdAsync(cmd) {
+  return new Promise((resolve) => {
+    exec(cmd, { encoding: 'utf8', timeout: 5000 }, (err, stdout) => {
+      if (err) {
+        console.warn('[pipewire] cmd failed:', cmd, err.message);
+        resolve(null);
+      } else {
+        resolve(stdout.trim());
+      }
+    });
+  });
+}
+
+async function parseSinkInputs() {
+  const out = await execCmdAsync('pactl list sink-inputs');
   if (!out) return [];
 
   const inputs = [];
@@ -290,9 +341,8 @@ function parseSinkInputs() {
   return inputs;
 }
 
-function getDefaultSinkName() {
-  // Get the current default sink name
-  const out = execCmd('pactl get-default-sink');
+async function getDefaultSinkName() {
+  const out = await execCmdAsync('pactl get-default-sink');
   return out ? out.trim() : null;
 }
 
@@ -306,8 +356,13 @@ function getPwPortName(nodeName, direction) {
 }
 
 async function setupPipeWireCapture() {
+  // Guard: if already set up, tear down first
+  if (pipewireSinkModule || pipewireMicModule) {
+    console.log('[pipewire] previous capture still active, tearing down first');
+    await teardownPipeWireCapture();
+  }
   // Create virtual sink
-  const moduleId = execCmd('pactl load-module module-null-sink sink_name=voxlink_capture sink_properties=device.description=VoxLink-Capture');
+  const moduleId = await execCmdAsync('pactl load-module module-null-sink sink_name=voxlink_capture sink_properties=device.description=VoxLink-Capture');
   if (!moduleId) return { ok: false, error: 'Failed to create virtual sink' };
   pipewireSinkModule = moduleId.trim();
   console.log('[pipewire] virtual sink created, module:', pipewireSinkModule);
@@ -316,7 +371,7 @@ async function setupPipeWireCapture() {
   await new Promise(r => setTimeout(r, 400));
 
   // Create virtual microphone source from monitor
-  const micModuleId = execCmd('pactl load-module module-virtual-source source_name=voxlink_mic source_properties=device.description=VoxLink-Mic master=voxlink_capture.monitor');
+  const micModuleId = await execCmdAsync('pactl load-module module-virtual-source source_name=voxlink_mic source_properties=device.description=VoxLink-Mic master=voxlink_capture.monitor');
   if (micModuleId) {
     pipewireMicModule = micModuleId.trim();
     console.log('[pipewire] virtual mic created, module:', pipewireMicModule);
@@ -327,23 +382,35 @@ async function setupPipeWireCapture() {
 
   // Connect voxlink_capture.monitor to default headphones/speakers via pw-link
   // So host can still hear the audio while it's being captured
-  const defaultSink = getDefaultSinkName();
+  const defaultSink = await getDefaultSinkName();
   if (defaultSink) {
     console.log('[pipewire] connecting monitor to default sink:', defaultSink);
-    execCmd(`pw-link voxlink_capture:monitor_FL "${defaultSink}:playback_FL"`);
-    execCmd(`pw-link voxlink_capture:monitor_FR "${defaultSink}:playback_FR"`);
+    // Validate that source ports exist before linking
+    const sourcePorts = await execCmdAsync('pw-link -o');
+    const hasMonitorFL = sourcePorts && sourcePorts.includes('voxlink_capture:monitor_FL');
+    const hasMonitorFR = sourcePorts && sourcePorts.includes('voxlink_capture:monitor_FR');
+    if (hasMonitorFL) {
+      const r1 = await execCmdAsync(`pw-link voxlink_capture:monitor_FL "${defaultSink}:playback_FL"`);
+      if (r1 === null) console.warn('[pipewire] pw-link FL failed — port may not exist');
+    } else {
+      console.warn('[pipewire] voxlink_capture:monitor_FL not found in output ports');
+    }
+    if (hasMonitorFR) {
+      const r2 = await execCmdAsync(`pw-link voxlink_capture:monitor_FR "${defaultSink}:playback_FR"`);
+      if (r2 === null) console.warn('[pipewire] pw-link FR failed — port may not exist');
+    } else {
+      console.warn('[pipewire] voxlink_capture:monitor_FR not found in output ports');
+    }
   }
 
   // Get our process PIDs (main + renderer)
   const ourPids = new Set([String(process.pid)]);
-  try {
-    const children = execCmd(`pgrep -P ${process.pid}`);
-    if (children) children.split('\n').filter(Boolean).forEach(p => ourPids.add(p));
-  } catch(e) {}
+  const children = await execCmdAsync(`pgrep -P ${process.pid}`);
+  if (children) children.split('\n').filter(Boolean).forEach(p => ourPids.add(p));
   console.log('[pipewire] our PIDs:', [...ourPids]);
 
   // Move all sink-inputs except ours to voxlink_capture
-  const inputs = parseSinkInputs();
+  const inputs = await parseSinkInputs();
   movedSinkInputs = [];
 
   for (const input of inputs) {
@@ -353,7 +420,7 @@ async function setupPipeWireCapture() {
     }
     if (!input.sink) continue;
 
-    const result = execCmd(`pactl move-sink-input ${input.id} voxlink_capture`);
+    const result = await execCmdAsync(`pactl move-sink-input ${input.id} voxlink_capture`);
     if (result !== null) {
       movedSinkInputs.push({ id: input.id, originalSink: input.sink });
       console.log('[pipewire] moved sink-input', input.id, 'binary:', input.binary);
@@ -367,20 +434,20 @@ async function setupPipeWireCapture() {
 async function teardownPipeWireCapture() {
   // Unload virtual mic first
   if (pipewireMicModule) {
-    execCmd(`pactl unload-module ${pipewireMicModule}`);
+    await execCmdAsync(`pactl unload-module ${pipewireMicModule}`);
     pipewireMicModule = null;
     console.log('[pipewire] virtual mic removed');
   }
 
   // Move sink-inputs back to original sinks
   for (const { id, originalSink } of movedSinkInputs) {
-    execCmd(`pactl move-sink-input ${id} ${originalSink}`);
+    await execCmdAsync(`pactl move-sink-input ${id} ${originalSink}`);
   }
   movedSinkInputs = [];
 
   // Unload virtual sink module
   if (pipewireSinkModule) {
-    execCmd(`pactl unload-module ${pipewireSinkModule}`);
+    await execCmdAsync(`pactl unload-module ${pipewireSinkModule}`);
     pipewireSinkModule = null;
     console.log('[pipewire] virtual sink removed');
   }
@@ -418,8 +485,10 @@ ipcMain.handle('get-screen-sources', async () => {
 
 ipcMain.handle('enable-loopback', async () => {
   if (!audioLoopback) return { ok: false, reason: 'not available' };
+  if (audioLoopbackInitialized) return { ok: true };
   try {
-    await audioLoopback.initMain(app);
+    audioLoopback.initMain(app);
+    audioLoopbackInitialized = true;
     return { ok: true };
   } catch(e) {
     return { ok: false, reason: e.message };
