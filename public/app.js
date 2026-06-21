@@ -10,6 +10,7 @@ let ws = null;
 let localStream = null;      // microphone
 let screenStream = null;     // screen share (outgoing)
 let isMuted = false, isDeafened = false, isSharingScreen = false;
+let noiseSuppressor = null;  // noise suppression processor
 
 // peers: Map<peerId, { name, pc, audioEl, stream, muted, sharingScreen, card }>
 const peers = new Map();
@@ -132,14 +133,20 @@ async function enterRoom(name, wsUrl, hosting) {
 
   console.log('[voxlink] enterRoom', wsUrl, 'hosting=', hosting);
 
-  // Get mic
+  // Get mic - improved quality settings
+  const audioConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    // Windows-specific quality improvements
+    sampleRate: 48000,
+    channelCount: 1,
+    latency: { ideal: 0.01 },
+  };
+
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      audio: audioConstraints,
       video: false
     });
     console.log('[voxlink] mic ok, tracks:', localStream.getTracks().length);
@@ -147,6 +154,14 @@ async function enterRoom(name, wsUrl, hosting) {
     console.error('[voxlink] mic error:', e);
     setError('Microphone access denied: ' + e.message);
     return;
+  }
+
+  // Initialize noise suppressor
+  if (!noiseSuppressor) {
+    noiseSuppressor = new NoiseSuppressor();
+    await noiseSuppressor.init(new AudioContext());
+    // Try to enable RNNoise WASM (may not be loaded yet as async module)
+    await noiseSuppressor.tryEnableRNNoise();
   }
 
   // Connect WS — wait for open or error with timeout
@@ -391,14 +406,28 @@ function createPC(peerId) {
         return;
       }
 
-      // Mic audio stream
+      // Mic audio stream - apply noise suppression
       peer.stream = stream;
       if (!peer.audioEl) {
         const audio = new Audio();
         audio.autoplay = true;
         peer.audioEl = audio;
       }
-      peer.audioEl.srcObject = stream;
+      
+      // Apply noise suppression if available
+      if (noiseSuppressor && noiseSuppressor.initialized) {
+        try {
+          const processedStream = noiseSuppressor.process(stream);
+          peer.audioEl.srcObject = processedStream;
+          console.log('[voxlink] noise suppression applied for peer', peerId);
+        } catch (e) {
+          console.warn('[voxlink] noise suppression failed, using raw stream:', e);
+          peer.audioEl.srcObject = stream;
+        }
+      } else {
+        peer.audioEl.srcObject = stream;
+      }
+      
       if (isDeafened) peer.audioEl.muted = true;
       startVolumeAnalyzer(peerId, stream);
     }
@@ -700,6 +729,11 @@ document.getElementById('ctrl-leave').addEventListener('click', async () => {
   peers.clear();
   localStream?.getTracks().forEach(t => t.stop());
   localStream = null;
+  // Cleanup noise suppressor
+  if (noiseSuppressor) {
+    noiseSuppressor.destroy();
+    noiseSuppressor = null;
+  }
   // Cleanup all AudioContexts
   audioCtxs.forEach((ctx, id) => { try { ctx.close(); } catch {} });
   audioCtxs.clear();
@@ -832,12 +866,19 @@ async function startScreenShare(sourceId, shareAudio = false) {
           console.warn('[voxlink] PipeWire setup failed:', e.message);
         }
       } else if (window.audioLoopback) {
-        // Windows: use electron-audio-loopback
+        // Windows: use electron-audio-loopback with improved quality
         try {
           await window.audioLoopback.enable();
           const loopbackStream = await navigator.mediaDevices.getDisplayMedia({
             video: true,
-            audio: true,
+            audio: {
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+              sampleRate: 48000,
+              channelCount: 2,
+              latency: { ideal: 0.01 },
+            },
           });
           loopbackStream.getVideoTracks().forEach(t => { t.stop(); loopbackStream.removeTrack(t); });
           audioStream = loopbackStream;
@@ -848,9 +889,21 @@ async function startScreenShare(sourceId, shareAudio = false) {
       }
 
       if (audioStream && audioStream.getAudioTracks().length > 0) {
+        // Apply noise suppression to screen audio if available
+        let processedAudioTracks = audioStream.getAudioTracks();
+        if (noiseSuppressor && noiseSuppressor.initialized && !isLinux) {
+          try {
+            const processedStream = noiseSuppressor.process(audioStream);
+            processedAudioTracks = processedStream.getAudioTracks();
+            console.log('[voxlink] noise suppression applied to screen audio');
+          } catch (e) {
+            console.warn('[voxlink] noise suppression failed for screen audio:', e);
+          }
+        }
+        
         screenStream = new MediaStream([
           ...videoStream.getVideoTracks(),
-          ...audioStream.getAudioTracks(),
+          ...processedAudioTracks,
         ]);
       } else {
         console.warn('[voxlink] no audio captured, video only');

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws: wss:; media-src 'self' blob: mediastream:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws: wss:; media-src 'self' blob: mediastream:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;">
 <title>VoxLink</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -157,6 +157,8 @@
   </div>
 </div>
 
+<script type="module" src="rnnoise-loader.js"></script>
+<script src="noise-suppressor.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
