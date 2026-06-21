@@ -1,34 +1,38 @@
 'use strict';
 
 /**
- * Noise Suppressor - Uses RNNoise WASM when available, falls back to AudioWorklet
- * Works on both Linux and Windows
+ * Noise Suppressor — send-side processing for local mic.
+ * Chain: source → ScriptProcessor → GainNode → MediaStreamDestination
+ * Handles RNNoise frameSize (480) vs ScriptProcessor buffer size mismatch
+ * via input accumulation + output queue.
  */
 class NoiseSuppressor {
   constructor() {
     this.audioContext = null;
-    this.workletNode = null;
     this.rnnoiseReady = false;
     this.rnnoiseInstance = null;
-    this.denoiseState = null;
     this.frameSize = 0;
-    this.inputBuffer = null;
-    this.inputBufferIndex = 0;
     this.initialized = false;
+    this.enabled = true;
+    this.source = null;
+    this.processor = null;
+    this.gainNode = null;
+    this.destination = null;
+    this.denoiseState = null;
   }
 
   async init(audioContext) {
     if (this.initialized) return true;
 
     this.audioContext = audioContext;
+    if (this.audioContext.state === 'suspended') {
+      await this.audioContext.resume();
+    }
 
-    // Try to initialize RNNoise WASM (may not be loaded yet as module)
     if (window.Rnnoise) {
       try {
         this.rnnoiseInstance = await window.Rnnoise.load();
-        this.denoiseState = this.rnnoiseInstance.createDenoiseState();
         this.frameSize = this.rnnoiseInstance.frameSize;
-        this.inputBuffer = new Float32Array(this.frameSize);
         this.rnnoiseReady = true;
         console.log('[noise-suppressor] RNNoise WASM initialized, frameSize:', this.frameSize);
       } catch (e) {
@@ -36,12 +40,10 @@ class NoiseSuppressor {
       }
     }
 
-    // Try AudioWorklet as fallback
     if (!this.rnnoiseReady) {
       try {
         await audioContext.audioWorklet.addModule('./noise-suppression.worklet.js');
-        this.workletNode = new AudioWorkletNode(audioContext, 'noise-suppression');
-        console.log('[noise-suppressor] AudioWorklet initialized');
+        console.log('[noise-suppressor] AudioWorklet module loaded');
       } catch (e) {
         console.warn('[noise-suppressor] AudioWorklet not available:', e);
       }
@@ -51,110 +53,164 @@ class NoiseSuppressor {
     return true;
   }
 
-  // Reinitialize if RNNoise becomes available after init
   async tryEnableRNNoise() {
     if (this.rnnoiseReady || !window.Rnnoise || !this.audioContext) return;
-
     try {
       this.rnnoiseInstance = await window.Rnnoise.load();
-      this.denoiseState = this.rnnoiseInstance.createDenoiseState();
       this.frameSize = this.rnnoiseInstance.frameSize;
-      this.inputBuffer = new Float32Array(this.frameSize);
       this.rnnoiseReady = true;
-      console.log('[noise-suppressor] RNNoise WASM enabled (late init), frameSize:', this.frameSize);
+      console.log('[noise-suppressor] RNNoise WASM enabled (late init)');
     } catch (e) {
       console.warn('[noise-suppressor] RNNoise late init failed:', e);
     }
   }
 
-  process(stream, options = {}) {
+  setEnabled(enabled) {
+    this.enabled = enabled;
+    console.log('[noise-suppressor] setEnabled:', enabled);
+  }
+
+  setGain(value) {
+    if (this.gainNode) {
+      this.gainNode.gain.value = value;
+    }
+  }
+
+  processStream(key, stream) {
     if (!this.initialized || !this.audioContext) {
       return stream;
     }
 
-    const source = this.audioContext.createMediaStreamSource(stream);
-    const destination = this.audioContext.createMediaStreamDestination();
+    if (!this.processor) {
+      return this._buildGraph(stream);
+    }
 
-    if (this.rnnoiseReady && this.denoiseState) {
-      // Use RNNoise WASM via ScriptProcessorNode
-      const bufferSize = 480;
-      const processor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
+    this._swapSource(stream);
+    return this.destination.stream;
+  }
+
+  _buildGraph(stream) {
+    this.source = this.audioContext.createMediaStreamSource(stream);
+    this.destination = this.audioContext.createMediaStreamDestination();
+    this.gainNode = this.audioContext.createGain();
+    this.gainNode.gain.value = 1.0;
+
+    if (this.rnnoiseReady && this.rnnoiseInstance) {
+      this.denoiseState = this.rnnoiseInstance.createDenoiseState();
       const frameSize = this.frameSize;
-      const denoiseState = this.denoiseState;
-      const inputBuffer = this.inputBuffer;
-      let inputBufferIndex = 0;
+      const nsRef = this;
 
-      processor.onaudioprocess = (e) => {
+      // Use buffer size 0 (Chrome default = power-of-2, typically 128)
+      this.processor = this.audioContext.createScriptProcessor(0, 1, 1);
+
+      // Input accumulation buffer
+      const accumBuffer = new Float32Array(frameSize);
+      let accumPos = 0;
+
+      // Output queue: processed frames ready to play
+      const outputQueue = [];
+      let outputChunk = null;
+      let outputPos = 0;
+
+      let frameCount = 0;
+
+      this.processor.onaudioprocess = (e) => {
         const input = e.inputBuffer.getChannelData(0);
         const output = e.outputBuffer.getChannelData(0);
 
+        // Accumulate input into frame buffer
         for (let i = 0; i < input.length; i++) {
-          inputBuffer[inputBufferIndex] = input[i];
-          inputBufferIndex++;
+          accumBuffer[accumPos++] = input[i];
 
-          if (inputBufferIndex >= frameSize) {
-            // Convert float32 to int16 for RNNoise
-            const int16Frame = new Int16Array(frameSize);
-            for (let j = 0; j < frameSize; j++) {
-              const s = Math.max(-1, Math.min(1, inputBuffer[j]));
-              int16Frame[j] = s < 0 ? s * 32768 : s * 32767;
+          if (accumPos >= frameSize) {
+            if (nsRef.enabled) {
+              // RNNoise processing
+              const int16Frame = new Int16Array(frameSize);
+              for (let j = 0; j < frameSize; j++) {
+                const s = Math.max(-1, Math.min(1, accumBuffer[j]));
+                int16Frame[j] = s < 0 ? s * 32768 : s * 32767;
+              }
+              nsRef.denoiseState.processFrame(int16Frame);
+              const processed = new Float32Array(frameSize);
+              for (let j = 0; j < frameSize; j++) {
+                processed[j] = int16Frame[j] / 32768;
+              }
+              outputQueue.push(processed);
+            } else {
+              // Bypass — pass through
+              outputQueue.push(new Float32Array(accumBuffer));
             }
-            // Process with RNNoise
-            denoiseState.processFrame(int16Frame);
-            // Convert back to float32
-            for (let j = 0; j < frameSize; j++) {
-              inputBuffer[j] = int16Frame[j] / 32768;
+            accumPos = 0;
+            frameCount++;
+            if (frameCount === 1 || frameCount % 500 === 0) {
+              console.log('[noise-suppressor] frame', frameCount, 'enabled:', nsRef.enabled, 'input[0]:', input[0]?.toFixed(4), 'queue:', outputQueue.length);
             }
-            inputBufferIndex = 0;
           }
         }
 
-        output.set(input);
+        // Fill output from queue
+        let written = 0;
+        while (written < output.length) {
+          if (!outputChunk) {
+            outputChunk = outputQueue.shift() || null;
+            outputPos = 0;
+          }
+          if (!outputChunk) {
+            output[written++] = 0;
+          } else {
+            const avail = outputChunk.length - outputPos;
+            const need = output.length - written;
+            const take = Math.min(avail, need);
+            for (let j = 0; j < take; j++) {
+              output[written++] = outputChunk[outputPos++];
+            }
+            if (outputPos >= outputChunk.length) {
+              outputChunk = null;
+            }
+          }
+        }
       };
 
-      source.connect(processor);
-      processor.connect(destination);
-      console.log('[noise-suppressor] RNNoise WASM processing active');
-    } else if (this.workletNode) {
-      // Use AudioWorklet fallback
-      source.connect(this.workletNode);
-      this.workletNode.connect(destination);
-      console.log('[noise-suppressor] AudioWorklet processing active');
+      this.source.connect(this.processor);
+      this.processor.connect(this.gainNode);
+      this.gainNode.connect(this.destination);
+      console.log('[noise-suppressor] RNNoise+Gain graph built (frameSize:', frameSize, ')');
+    } else if (this.audioContext.audioWorklet) {
+      this.processor = new AudioWorkletNode(this.audioContext, 'noise-suppression');
+      this.source.connect(this.processor);
+      this.processor.connect(this.gainNode);
+      this.gainNode.connect(this.destination);
+      console.log('[noise-suppressor] AudioWorklet+Gain graph built');
     } else {
-      // Basic noise gate fallback
-      const analyser = this.audioContext.createAnalyser();
-      const gainNode = this.audioContext.createGain();
-
-      source.connect(analyser);
-      analyser.connect(gainNode);
-      gainNode.connect(destination);
-
-      const threshold = options.threshold || 0.01;
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-      const checkVolume = () => {
-        if (!this.initialized) return;
-        analyser.getByteFrequencyData(dataArray);
-        const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-        gainNode.gain.value = average > threshold * 255 ? 1.0 : 0.1;
-        requestAnimationFrame(checkVolume);
-      };
-      checkVolume();
-      console.log('[noise-suppressor] Basic noise gate active');
+      return stream;
     }
 
-    return destination.stream;
+    return this.destination.stream;
+  }
+
+  _swapSource(newStream) {
+    try { this.source.disconnect(); } catch {}
+    this.source = this.audioContext.createMediaStreamSource(newStream);
+    this.source.connect(this.processor);
+    console.log('[noise-suppressor] source swapped');
   }
 
   destroy() {
     this.initialized = false;
-    if (this.denoiseState) {
-      this.denoiseState.destroy();
-      this.denoiseState = null;
-    }
-    if (this.workletNode) {
-      this.workletNode.disconnect();
-      this.workletNode = null;
+    try {
+      if (this.source) this.source.disconnect();
+      if (this.processor) this.processor.disconnect();
+      if (this.gainNode) this.gainNode.disconnect();
+      if (this.denoiseState) this.denoiseState.destroy();
+    } catch {}
+    this.source = null;
+    this.processor = null;
+    this.gainNode = null;
+    this.destination = null;
+    this.denoiseState = null;
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      this.audioContext.close().catch(() => {});
+      this.audioContext = null;
     }
     this.rnnoiseReady = false;
     this.rnnoiseInstance = null;

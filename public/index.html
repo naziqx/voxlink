@@ -92,31 +92,6 @@
           <span class="my-role" id="my-role-sb">guest</span>
         </div>
       </div>
-      <div class="ctrl-row">
-        <button class="ctrl" id="ctrl-mute" title="Mute mic">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z"/>
-            <path d="M19 10a7 7 0 0 1-14 0M12 19v4M8 23h8"/>
-          </svg>
-        </button>
-        <button class="ctrl" id="ctrl-deafen" title="Deafen">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
-            <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
-          </svg>
-        </button>
-        <button class="ctrl" id="ctrl-screen" title="Share screen">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2" y="3" width="20" height="14" rx="2"/>
-            <path d="M8 21h8M12 17v4"/>
-          </svg>
-        </button>
-        <button class="ctrl ctrl-leave" id="ctrl-leave" title="Leave">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
-          </svg>
-        </button>
-      </div>
     </div>
   </div>
 
@@ -126,11 +101,171 @@
 
     <!-- Screen share viewer -->
     <div class="share-viewer" id="share-viewer" style="display:none">
-      <div class="share-bar">
-        <span id="share-bar-label">Screen share</span>
-        <button class="share-close" id="share-close">✕ Close</button>
-      </div>
       <video id="share-video" autoplay playsinline></video>
+      <div class="share-overlay">
+        <span class="share-label" id="share-bar-label"></span>
+        <button class="share-close-btn" id="share-close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="20" height="20">
+            <path d="M18 6L6 18M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Bottom control bar -->
+    <div class="bottom-bar">
+      <div class="bottom-bar-left">
+        <button class="ctrl-ns" id="ctrl-ns" title="Noise Suppression">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+          </svg>
+          <span class="ns-label">NS</span>
+        </button>
+        <button class="ctrl-back-voice" id="ctrl-back-voice" style="display:none" title="Back to Voice">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
+            <path d="M19 12H5M12 19l-7-7 7-7"/>
+          </svg>
+          <span>Voice</span>
+        </button>
+      </div>
+      <div class="bottom-bar-center">
+        <button class="ctrl-main" id="ctrl-mute" title="Mute/Unmute">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4z"/>
+            <path d="M19 10a7 7 0 0 1-14 0M12 19v4M8 23h8"/>
+          </svg>
+        </button>
+        <button class="ctrl-main" id="ctrl-deafen" title="Deafen/Undeafen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
+            <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+          </svg>
+        </button>
+        <button class="ctrl-main" id="ctrl-screen" title="Share Screen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <path d="M8 21h8M12 17v4"/>
+          </svg>
+        </button>
+        <button class="ctrl-main ctrl-leave" id="ctrl-leave" title="Disconnect">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+          </svg>
+        </button>
+      </div>
+      <div class="bottom-bar-right">
+        <button class="ctrl-settings" id="ctrl-settings" title="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+        <div class="room-name-badge">
+          <svg viewBox="0 0 24 24" fill="none" width="14" height="14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+          <span id="peer-count-badge">1</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── CONTEXT MENU ─────────────────────────────────── -->
+<div id="ctx-menu" class="ctx-menu" style="display:none">
+  <div class="ctx-header" id="ctx-title">User</div>
+  <div class="ctx-row">
+    <label>Volume</label>
+    <input type="range" id="ctx-volume" min="0" max="200" value="100" class="ctx-slider"/>
+    <span class="ctx-value" id="ctx-volume-val">100%</span>
+  </div>
+</div>
+
+<!-- ── SETTINGS MODAL ────────────────────────────────── -->
+<div id="modal-settings" class="modal" style="display:none">
+  <div class="modal-box settings-modal">
+    <div class="modal-header">
+      <span>Settings</span>
+      <button class="modal-close" id="settings-close">✕</button>
+    </div>
+    <div class="settings-body">
+
+      <div class="settings-section">
+        <div class="settings-section-title">Audio Input</div>
+        <div class="settings-row">
+          <label>Microphone</label>
+          <select id="set-mic-device" class="settings-select"></select>
+        </div>
+        <div class="settings-row">
+          <label>Input Volume</label>
+          <div class="settings-slider-row">
+            <input type="range" id="set-input-gain" min="0" max="200" value="100" class="settings-slider"/>
+            <span class="settings-value" id="set-input-gain-val">100%</span>
+          </div>
+        </div>
+        <div class="settings-row">
+          <label>VAD Threshold (voice detection)</label>
+          <div class="settings-slider-row">
+            <input type="range" id="set-vad-threshold" min="1" max="50" value="15" class="settings-slider"/>
+            <span class="settings-value" id="set-vad-threshold-val">15</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Audio Output</div>
+        <div class="settings-row">
+          <label>Output Device</label>
+          <select id="set-output-device" class="settings-select"></select>
+        </div>
+        <div id="set-peer-volumes"></div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Processing</div>
+        <div class="settings-row settings-toggle-row">
+          <label>Noise Suppression (RNNoise)</label>
+          <label class="toggle"><input type="checkbox" id="set-ns-enabled" checked/><span class="toggle-slider"></span></label>
+        </div>
+        <div class="settings-row settings-toggle-row">
+          <label>Echo Cancellation</label>
+          <label class="toggle"><input type="checkbox" id="set-echo-cancellation" checked/><span class="toggle-slider"></span></label>
+        </div>
+        <div class="settings-row settings-toggle-row">
+          <label>Push-to-Talk</label>
+          <label class="toggle"><input type="checkbox" id="set-ptt-enabled"/><span class="toggle-slider"></span></label>
+        </div>
+        <div class="settings-row" id="set-ptt-key-row" style="display:none">
+          <label>PTT Key</label>
+          <button id="set-ptt-key-btn" class="settings-key-btn">Press a key...</button>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Screen Share</div>
+        <div class="settings-row">
+          <label>Resolution</label>
+          <select id="set-video-res" class="settings-select">
+            <option value="1920x1080">1920×1080</option>
+            <option value="1280x720">1280×720</option>
+            <option value="854x480">854×480</option>
+            <option value="640x360">640×360</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <label>Frame Rate</label>
+          <select id="set-video-fps" class="settings-select">
+            <option value="30">30 FPS</option>
+            <option value="24">24 FPS</option>
+            <option value="15">15 FPS</option>
+            <option value="10">10 FPS</option>
+          </select>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
@@ -158,7 +293,7 @@
 </div>
 
 <script type="module" src="rnnoise-loader.js"></script>
-<script src="noise-suppressor.js"></script>
-<script src="app.js"></script>
+<script src="noise-suppressor.js?v=2"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>

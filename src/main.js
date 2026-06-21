@@ -160,7 +160,7 @@ function startSignalingServer(port) {
     httpServer = http.createServer();
     signalingServer = new WebSocketServer({ server: httpServer });
 
-    // clients: Map<ws, { id, name, room }>
+    // clients: Map<ws, { id, name, room, sharingScreen, screenAudioStreamId, screenAudioTrackId }>
     const clients = new Map();
     let idCounter = 0;
 
@@ -197,7 +197,13 @@ function startSignalingServer(port) {
             const peers = [];
             clients.forEach((m, pws) => {
               if (pws !== ws && m.room === meta.room) {
-                peers.push({ id: m.id, name: m.name });
+                peers.push({
+                  id: m.id,
+                  name: m.name,
+                  sharingScreen: m.sharingScreen || false,
+                  screenAudioStreamId: m.screenAudioStreamId || null,
+                  screenAudioTrackId: m.screenAudioTrackId || null,
+                });
               }
             });
 
@@ -227,6 +233,9 @@ function startSignalingServer(port) {
           }
 
           case 'screen_start': {
+            meta.sharingScreen = true;
+            meta.screenAudioStreamId = msg.audioStreamId || null;
+            meta.screenAudioTrackId = msg.audioTrackId || null;
             broadcast(meta.room, { 
               type: 'screen_start', 
               from: meta.id, 
@@ -238,6 +247,9 @@ function startSignalingServer(port) {
           }
 
           case 'screen_stop': {
+            meta.sharingScreen = false;
+            meta.screenAudioStreamId = null;
+            meta.screenAudioTrackId = null;
             broadcast(meta.room, { type: 'screen_stop', from: meta.id }, ws, clients);
             break;
           }

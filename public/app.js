@@ -7,10 +7,12 @@ const AVATAR_COLORS = ['#5865f2','#23a55a','#eb459e','#fee75c','#ed4245','#57f28
 // ── State ─────────────────────────────────────────────────────────────────────
 let myId = null, myName = '', isHost = false;
 let ws = null;
-let localStream = null;      // microphone
+let localStream = null;      // microphone (processed — goes to WebRTC)
+let rawMicStream = null;     // raw mic from getUserMedia (for stopping on switch)
 let screenStream = null;     // screen share (outgoing)
-let isMuted = false, isDeafened = false, isSharingScreen = false;
+let isMuted = false, isDeafened = false, isSharingScreen = false, isNoiseSuppression = true;
 let noiseSuppressor = null;  // noise suppression processor
+let isLeaving = false;       // true when user initiated leave
 
 // peers: Map<peerId, { name, pc, audioEl, stream, muted, sharingScreen, card }>
 const peers = new Map();
@@ -35,6 +37,34 @@ function showScreen(id) {
 }
 function setError(msg) {
   document.getElementById('connect-error').textContent = msg;
+}
+function cleanupRoom() {
+  stopScreenShare().catch(() => {});
+  peers.forEach((_, id) => closePeer(id));
+  peers.clear();
+  localStream?.getTracks().forEach(t => t.stop());
+  rawMicStream?.getTracks().forEach(t => t.stop());
+  localStream = null;
+  rawMicStream = null;
+  screenStream = null;
+  isMuted = false;
+  isDeafened = false;
+  isSharingScreen = false;
+  viewingPeerId = null;
+  myId = null;
+  isLeaving = false;
+  if (noiseSuppressor) { noiseSuppressor.destroy(); noiseSuppressor = null; }
+  audioCtxs.forEach((ctx) => { try { ctx.close(); } catch {} });
+  audioCtxs.clear();
+  document.getElementById('voice-grid').innerHTML = '';
+  document.getElementById('peers-list').innerHTML = '';
+  document.getElementById('share-viewer').style.display = 'none';
+  document.getElementById('ctrl-back-voice').style.display = 'none';
+  document.getElementById('ctrl-mute').classList.remove('danger');
+  document.getElementById('ctrl-deafen').classList.remove('danger');
+  document.getElementById('ctrl-screen').classList.remove('active');
+  document.getElementById('share-video').srcObject = null;
+  isConnecting = false;
 }
 
 // ── Connect screen UI ─────────────────────────────────────────────────────────
@@ -133,22 +163,25 @@ async function enterRoom(name, wsUrl, hosting) {
 
   console.log('[voxlink] enterRoom', wsUrl, 'hosting=', hosting);
 
-  // Get mic - improved quality settings
+  // Get mic — browser NS disabled, RNNoise handles it
   const audioConstraints = {
-    echoCancellation: true,
-    noiseSuppression: true,
+    echoCancellation: settings.echoCancellation,
+    noiseSuppression: false,
     autoGainControl: true,
-    // Windows-specific quality improvements
     sampleRate: 48000,
     channelCount: 1,
-    latency: { ideal: 0.01 },
   };
 
+  if (settings.micDeviceId) {
+    audioConstraints.deviceId = { exact: settings.micDeviceId };
+  }
+
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({
+    rawMicStream = await navigator.mediaDevices.getUserMedia({
       audio: audioConstraints,
       video: false
     });
+    localStream = rawMicStream;
     console.log('[voxlink] mic ok, tracks:', localStream.getTracks().length);
   } catch (e) {
     console.error('[voxlink] mic error:', e);
@@ -156,12 +189,24 @@ async function enterRoom(name, wsUrl, hosting) {
     return;
   }
 
-  // Initialize noise suppressor
+  // Initialize noise suppressor — process local mic BEFORE anything else
   if (!noiseSuppressor) {
+    const nsCtx = new AudioContext();
+    await nsCtx.resume();
     noiseSuppressor = new NoiseSuppressor();
-    await noiseSuppressor.init(new AudioContext());
-    // Try to enable RNNoise WASM (may not be loaded yet as async module)
+    await noiseSuppressor.init(nsCtx);
     await noiseSuppressor.tryEnableRNNoise();
+  }
+  // Build RNNoise+Gain graph on local mic — result is the stream that goes to WebRTC
+  if (noiseSuppressor && noiseSuppressor.initialized) {
+    try {
+      const processedLocal = noiseSuppressor.processStream('self', localStream);
+      localStream = processedLocal;
+      noiseSuppressor.setGain(settings.inputGain / 100);
+      console.log('[voxlink] local mic processed through noise suppressor');
+    } catch (e) {
+      console.warn('[voxlink] local noise suppression failed, using raw mic:', e);
+    }
   }
 
   // Connect WS — wait for open or error with timeout
@@ -211,8 +256,15 @@ async function enterRoom(name, wsUrl, hosting) {
 
   ws.addEventListener('close', (e) => {
     console.log('[voxlink] ws closed', e.code, e.reason);
-    const el = document.getElementById('room-conn-status');
-    if (el) { el.textContent = '● Disconnected'; el.style.color = 'var(--red)'; }
+    if (isLeaving) return; // user initiated leave, already cleaned up
+    // Connection lost — host disconnected or network issue
+    if (myId) {
+      console.log('[voxlink] unexpected disconnect, cleaning up');
+      notify('Host disconnected');
+      cleanupRoom();
+      setError('Host disconnected — session ended');
+      showScreen('screen-connect');
+    }
   });
 
   ws.addEventListener('error', (e) => {
@@ -244,7 +296,16 @@ async function handleSignal(msg) {
       showRoomUI();
       // Initiate connections to all existing peers
       for (const peer of msg.peers) {
-        peers.set(peer.id, { name: peer.name, pc: null, audioEl: null, stream: null, muted: false, sharingScreen: false });
+        peers.set(peer.id, {
+          name: peer.name,
+          pc: null,
+          audioEl: null,
+          stream: null,
+          muted: false,
+          sharingScreen: peer.sharingScreen || false,
+          screenAudioStreamId: peer.screenAudioStreamId || null,
+          screenAudioTrackId: peer.screenAudioTrackId || null,
+        });
         await initiateCall(peer.id);
       }
       renderPeers();
@@ -304,7 +365,7 @@ async function handleSignal(msg) {
         video.muted = true;
         video.srcObject = null;
         document.getElementById('share-viewer').style.display = 'none';
-        document.getElementById('voice-grid').style.display = 'flex';
+        document.getElementById('ctrl-back-voice').style.display = 'none';
         // Restore peer mic audio
         peers.forEach(p => { if (p.audioEl) p.audioEl.muted = isDeafened; });
       }
@@ -355,34 +416,67 @@ function createPC(peerId) {
       updateCardLabel(peerId);
       showSharedScreen(stream, peer.name, peerId);
 
-      // Apply any buffered screen audio tracks that arrived before video
+      // Apply any buffered audio tracks — reclassify using screenAudioTrackId
       if (peer.pendingScreenAudio) {
+        const screenAudio = [];
+        const micAudio = [];
         peer.pendingScreenAudio.forEach(audioTrack => {
-          console.log('[voxlink] applying buffered screen audio track');
+          // Use track ID from screen_start signal (track.streams is unreliable in WebRTC)
+          if (peer.screenAudioTrackId && audioTrack.id === peer.screenAudioTrackId) {
+            screenAudio.push(audioTrack);
+          } else {
+            micAudio.push(audioTrack);
+          }
+        });
+        // Add screen audio to the screen stream
+        screenAudio.forEach(audioTrack => {
+          console.log('[voxlink] late-join screen audio matched by track id');
           stream.addTrack(audioTrack);
+        });
+        // Treat remaining as mic audio — only set if we don't already have audio playing
+        micAudio.forEach(audioTrack => {
+          console.log('[voxlink] late-join mic audio (reclassified)');
+          peer.stream = new MediaStream([audioTrack]);
+          if (!peer.audioEl) {
+            const audio = new Audio();
+            audio.autoplay = true;
+            peer.audioEl = audio;
+          }
+          peer.audioEl.srcObject = peer.stream;
+          if (isDeafened) peer.audioEl.muted = true;
+          startVolumeAnalyzer(peerId, peer.stream);
         });
         peer.pendingScreenAudio = null;
         // Reassign srcObject so video element picks up new audio track
         const video = document.getElementById('share-video');
-        if (video) {
+        if (video && screenAudio.length > 0) {
           const wasMuted = video.muted;
           video.srcObject = stream;
           video.muted = wasMuted;
           video.play().catch(e => console.warn('[voxlink] video play failed:', e.message));
-          console.log('[voxlink] video srcObject reassigned with audio');
         }
       }
     } else {
-      // Audio track — check if it belongs to screen stream (same stream id)
-      // or is a mic stream (different stream id)
+      // Audio track — identify if it's screen audio or mic audio
       console.log('[voxlink] audio track stream id:', stream.id, 'screenAudioStreamId:', peer.screenAudioStreamId);
 
-      // Identify screen audio: match by track id or stream id sent in screen_start signal.
-      // Note: _isScreenAudio and label checks don't cross WebRTC (receiver gets different objects).
+      // Detect screen audio by multiple methods:
+      // 1. Stream identity: same stream as the screen video (works for late joiners too)
+      // 2. Signal-based: track/stream ID from screen_start message
       const isScreenAudio = 
+        (peer.screenStream && stream.id === peer.screenStream.id) ||
         (peer.screenAudioTrackId && track.id === peer.screenAudioTrackId) ||
         (peer.screenAudioStreamId && stream.id === peer.screenAudioStreamId);
-      console.log('[voxlink] isScreenAudio:', isScreenAudio, 'track.id:', track.id, 'expected:', peer.screenAudioTrackId);
+      console.log('[voxlink] isScreenAudio:', isScreenAudio);
+
+      // Late-join: if peer is sharing screen but video hasn't arrived yet,
+      // buffer this audio — we'll reclassify when video arrives
+      if (!isScreenAudio && peer.sharingScreen && !peer.screenStream && !peer.stream) {
+        if (!peer.pendingScreenAudio) peer.pendingScreenAudio = [];
+        peer.pendingScreenAudio.push(track);
+        console.log('[voxlink] buffering audio for late-join screen share');
+        return;
+      }
 
       if (isScreenAudio) {
         if (peer.screenStream) {
@@ -413,21 +507,7 @@ function createPC(peerId) {
         audio.autoplay = true;
         peer.audioEl = audio;
       }
-      
-      // Apply noise suppression if available
-      if (noiseSuppressor && noiseSuppressor.initialized) {
-        try {
-          const processedStream = noiseSuppressor.process(stream);
-          peer.audioEl.srcObject = processedStream;
-          console.log('[voxlink] noise suppression applied for peer', peerId);
-        } catch (e) {
-          console.warn('[voxlink] noise suppression failed, using raw stream:', e);
-          peer.audioEl.srcObject = stream;
-        }
-      } else {
-        peer.audioEl.srcObject = stream;
-      }
-      
+      peer.audioEl.srcObject = stream;
       if (isDeafened) peer.audioEl.muted = true;
       startVolumeAnalyzer(peerId, stream);
     }
@@ -456,11 +536,14 @@ async function handleOffer(msg) {
 
   // RENEGOTIATION: reuse existing PC (e.g. screen share added)
   if (existingPeer?.pc) {
+    // Glary condition: we sent an offer AND received one simultaneously.
+    // Rollback is destructive (loses local tracks). Instead, ignore the
+    // remote offer — our offer is already in flight and the answer will arrive.
+    if (existingPeer.pc.signalingState === 'have-local-offer') {
+      console.log('[voxlink] ignoring remote offer (glary condition), our offer is pending');
+      return;
+    }
     try {
-      // Handle glary condition: both sides sent offer simultaneously
-      if (existingPeer.pc.signalingState === 'have-local-offer') {
-        await existingPeer.pc.setLocalDescription({ type: 'rollback' });
-      }
       await existingPeer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
       const answer = await existingPeer.pc.createAnswer();
       await existingPeer.pc.setLocalDescription(answer);
@@ -505,6 +588,12 @@ function closePeer(id) {
   peer.pc?.close();
   if (peer.audioEl) { peer.audioEl.pause(); peer.audioEl.srcObject = null; }
   document.getElementById('vc-' + id)?.remove();
+  // Cleanup per-peer volume analyzer
+  if (audioCtxs.has(id)) {
+    const ctx = audioCtxs.get(id);
+    try { ctx.close(); } catch {}
+    audioCtxs.delete(id);
+  }
 }
 
 // ── Volume Analyzer ───────────────────────────────────────────────────────────
@@ -526,7 +615,7 @@ function startVolumeAnalyzer(id, stream) {
       if (!card) { ctx.close(); audioCtxs.delete(id); return; }
       analyser.getByteFrequencyData(data);
       const vol = data.reduce((a, b) => a + b, 0) / data.length / 255;
-      const speaking = vol > 0.015;
+      const speaking = vol > settings.vadThreshold / 1000;
       card.classList.toggle('speaking', speaking);
       const bars = card.querySelectorAll('.vc-bar');
       bars.forEach(b => {
@@ -556,7 +645,7 @@ function startLocalAnalyzer() {
     if (!card) { ctx.close(); audioCtxs.delete('local'); return; }
     analyser.getByteFrequencyData(data);
     const vol = data.reduce((a, b) => a + b, 0) / data.length / 255;
-    const speaking = vol > 0.015 && !isMuted;
+    const speaking = vol > settings.vadThreshold / 1000 && !isMuted;
     card.classList.toggle('speaking', speaking);
     const bars = card.querySelectorAll('.vc-bar');
     bars.forEach(b => {
@@ -596,6 +685,13 @@ function addVoiceCard(id, name) {
   `;
   // Click to view/hide this peer's screen
   card.addEventListener('click', () => switchToScreen(id));
+  // Right-click context menu for volume (skip self)
+  card.addEventListener('contextmenu', (e) => {
+    if (id === myId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    showCtxMenu(e.clientX, e.clientY, id, name);
+  });
   document.getElementById('voice-grid').appendChild(card);
 }
 
@@ -610,7 +706,7 @@ function switchToScreen(peerId) {
     video.muted = true;
     video.srcObject = null;
     document.getElementById('share-viewer').style.display = 'none';
-    document.getElementById('voice-grid').style.display = 'flex';
+    document.getElementById('ctrl-back-voice').style.display = 'none';
     document.querySelectorAll('.voice-card').forEach(c => c.classList.remove('viewing-screen'));
     // Restore peer mic audio
     peers.forEach(p => { if (p.audioEl) p.audioEl.muted = isDeafened; });
@@ -686,6 +782,10 @@ function renderPeers() {
   peers.forEach((peer, id) => {
     list.appendChild(makePeerRow(id, peer.name, { muted: peer.muted, sharingScreen: peer.sharingScreen }));
   });
+
+  // Update peer count badge
+  const badge = document.getElementById('peer-count-badge');
+  if (badge) badge.textContent = peers.size + 1;
 }
 
 function makePeerRow(id, name, { muted, sharingScreen, isMe } = {}) {
@@ -715,6 +815,25 @@ document.getElementById('ctrl-mute').addEventListener('click', () => {
   renderPeers();
 });
 
+// Noise suppression toggle
+document.getElementById('ctrl-ns').addEventListener('click', () => {
+  isNoiseSuppression = !isNoiseSuppression;
+  settings.nsEnabled = isNoiseSuppression;
+  saveSettings();
+  const btn = document.getElementById('ctrl-ns');
+  btn.classList.toggle('active', isNoiseSuppression);
+  // Sync settings modal checkbox
+  const nsChk = document.getElementById('set-ns-enabled');
+  if (nsChk) nsChk.checked = isNoiseSuppression;
+  // Toggle noise suppression bypass — graph stays active, only internal logic changes
+  if (noiseSuppressor) {
+    noiseSuppressor.setEnabled(isNoiseSuppression);
+  }
+});
+
+// Initialize NS button state
+document.getElementById('ctrl-ns').classList.add('active');
+
 document.getElementById('ctrl-deafen').addEventListener('click', () => {
   isDeafened = !isDeafened;
   peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = isDeafened; });
@@ -722,23 +841,11 @@ document.getElementById('ctrl-deafen').addEventListener('click', () => {
 });
 
 document.getElementById('ctrl-leave').addEventListener('click', async () => {
+  isLeaving = true;
   await stopScreenShare();
   ws?.close();
   if (isHost) await window.voxlink.stopHost();
-  peers.forEach((_, id) => closePeer(id));
-  peers.clear();
-  localStream?.getTracks().forEach(t => t.stop());
-  localStream = null;
-  // Cleanup noise suppressor
-  if (noiseSuppressor) {
-    noiseSuppressor.destroy();
-    noiseSuppressor = null;
-  }
-  // Cleanup all AudioContexts
-  audioCtxs.forEach((ctx, id) => { try { ctx.close(); } catch {} });
-  audioCtxs.clear();
-  document.getElementById('voice-grid').innerHTML = '';
-  document.getElementById('peers-list').innerHTML = '';
+  cleanupRoom();
   showScreen('screen-connect');
 });
 
@@ -808,18 +915,7 @@ async function startScreenShare(sourceId, shareAudio = false) {
     // Step 1: get video via Electron desktopCapturer (our custom picker sourceId)
     const videoStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: {
-        mandatory: {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: sourceId,
-          minWidth: 1280,
-          maxWidth: 1920,
-          minHeight: 720,
-          maxHeight: 1080,
-          minFrameRate: 15,
-          maxFrameRate: 30,
-        }
-      }
+      video: getVideoConstraints(),
     });
 
     if (shareAudio) {
@@ -889,21 +985,9 @@ async function startScreenShare(sourceId, shareAudio = false) {
       }
 
       if (audioStream && audioStream.getAudioTracks().length > 0) {
-        // Apply noise suppression to screen audio if available
-        let processedAudioTracks = audioStream.getAudioTracks();
-        if (noiseSuppressor && noiseSuppressor.initialized && !isLinux) {
-          try {
-            const processedStream = noiseSuppressor.process(audioStream);
-            processedAudioTracks = processedStream.getAudioTracks();
-            console.log('[voxlink] noise suppression applied to screen audio');
-          } catch (e) {
-            console.warn('[voxlink] noise suppression failed for screen audio:', e);
-          }
-        }
-        
         screenStream = new MediaStream([
           ...videoStream.getVideoTracks(),
-          ...processedAudioTracks,
+          ...audioStream.getAudioTracks(),
         ]);
       } else {
         console.warn('[voxlink] no audio captured, video only');
@@ -931,11 +1015,13 @@ async function startScreenShare(sourceId, shareAudio = false) {
     // Apply quality constraints on the capture track
     const videoTrack = screenStream.getVideoTracks()[0];
     if (videoTrack) {
+      const [w, h] = settings.videoRes.split('x').map(Number);
+      const fps = parseInt(settings.videoFps) || 30;
       try {
         await videoTrack.applyConstraints({
-          width: { ideal: 1920, max: 1920 },
-          height: { ideal: 1080, max: 1080 },
-          frameRate: { ideal: 30, min: 15 },
+          width: { ideal: w, max: w },
+          height: { ideal: h, max: h },
+          frameRate: { ideal: fps, min: Math.min(fps, 10) },
         });
         console.log('[voxlink] screen track settings:', JSON.stringify(videoTrack.getSettings()));
       } catch (e) {
@@ -953,9 +1039,8 @@ async function startScreenShare(sourceId, shareAudio = false) {
   const shareVideo = document.getElementById('share-video');
   shareVideo.srcObject = screenStream;
   shareVideo.muted = true;  // prevent self-echo
-  document.getElementById('share-bar-label').textContent = '📺 You are sharing your screen';
+  document.getElementById('share-bar-label').textContent = 'You are sharing your screen';
   shareViewer.style.display = 'flex';
-  document.getElementById('voice-grid').style.display = 'none';
 
   // Send screen_start BEFORE renegotiate so viewers store audioStreamId before ontrack fires
   const screenAudioTrack = screenStream.getAudioTracks()[0];
@@ -1017,7 +1102,7 @@ async function stopScreenShare() {
 
   document.getElementById('ctrl-screen').classList.remove('active');
   document.getElementById('share-viewer').style.display = 'none';
-  document.getElementById('voice-grid').style.display = 'flex';
+  document.getElementById('ctrl-back-voice').style.display = 'none';
   document.getElementById('share-video').srcObject = null;
   renderPeers();
 
@@ -1040,7 +1125,7 @@ async function forceHighBitrate() {
         params.degradationPreference = 'maintain-resolution';
         params.encodings[0].maxBitrate = 10_000_000; // 10 Mbps
         params.encodings[0].scaleResolutionDownBy = 1.0;
-        params.encodings[0].maxFramerate = 30;
+        params.encodings[0].maxFramerate = parseInt(settings.videoFps) || 30;
         await sender.setParameters(params);
         console.log('[voxlink] quality params set for peer', id);
       } catch (e) {
@@ -1091,19 +1176,48 @@ async function renegotiate(pc, peer) {
 }
 
 // Close shared screen view
-document.getElementById('share-close').addEventListener('click', () => {
+document.getElementById('share-close').addEventListener('click', closeScreenViewer);
+document.getElementById('ctrl-back-voice').addEventListener('click', closeScreenViewer);
+
+// Right-click on shared screen for volume
+document.getElementById('share-viewer').addEventListener('contextmenu', (e) => {
+  if (!viewingPeerId) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const peer = peers.get(viewingPeerId);
+  const name = peer?.name || '?';
+  // Override ctx slider to control share-video volume
+  ctxTargetPeerId = viewingPeerId;
+  const menu = document.getElementById('ctx-menu');
+  const title = document.getElementById('ctx-title');
+  const slider = document.getElementById('ctx-volume');
+  const valEl = document.getElementById('ctx-volume-val');
+
+  title.textContent = name + ' (screen)';
+  const video = document.getElementById('share-video');
+  const vol = Math.round(video.volume * 100);
+  slider.value = vol;
+  valEl.textContent = vol + '%';
+
+  menu.style.display = 'block';
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = Math.min(e.clientX, window.innerWidth - rect.width - 8) + 'px';
+  menu.style.top = Math.min(e.clientY, window.innerHeight - rect.height - 8) + 'px';
+});
+
+function closeScreenViewer() {
   const video = document.getElementById('share-video');
   video.muted = true;
   video.srcObject = null;
   viewingPeerId = null;
   document.querySelectorAll('.voice-card').forEach(c => c.classList.remove('viewing-screen'));
   document.getElementById('share-viewer').style.display = 'none';
-  document.getElementById('voice-grid').style.display = 'flex';
+  document.getElementById('ctrl-back-voice').style.display = 'none';
   // Restore peer mic audio (unless user has deafen on)
   peers.forEach(peer => {
     if (peer.audioEl) peer.audioEl.muted = isDeafened;
   });
-});
+}
 
 function showSharedScreen(stream, peerName, peerId) {
   viewingPeerId = peerId || null;
@@ -1111,9 +1225,9 @@ function showSharedScreen(stream, peerName, peerId) {
   video.srcObject = stream;
   video.muted = false;
   video.play().catch(e => console.warn('[voxlink] play failed:', e.message));
-  document.getElementById('share-bar-label').textContent = `🖥 ${peerName} is sharing their screen`;
+  document.getElementById('share-bar-label').textContent = `${peerName} is sharing their screen`;
   document.getElementById('share-viewer').style.display = 'flex';
-  document.getElementById('voice-grid').style.display = 'none';
+  document.getElementById('ctrl-back-voice').style.display = 'flex';
 }
 
 // ── Room UI init ──────────────────────────────────────────────────────────────
@@ -1132,5 +1246,421 @@ function notify(body) {
   window.voxlink.showNotification({ title: 'VoxLink', body });
 }
 
+// ── Settings ──────────────────────────────────────────────────────────────────
+const SETTINGS_KEY = 'voxlink_settings';
+const defaultSettings = {
+  micDeviceId: '',
+  outputDeviceId: '',
+  inputGain: 100,
+  vadThreshold: 15,
+  nsEnabled: true,
+  echoCancellation: true,
+  pttEnabled: false,
+  pttKey: '',
+  videoRes: '1920x1080',
+  videoFps: '30',
+  peerVolumes: {},
+};
+
+let settings = { ...defaultSettings };
+let pttPressed = false;
+let pttListening = false;
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) settings = { ...defaultSettings, ...JSON.parse(raw) };
+  } catch {}
+}
+
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+}
+
+function applySettings() {
+  // Input gain
+  applyInputGain();
+
+  // NS
+  if (noiseSuppressor) noiseSuppressor.setEnabled(settings.nsEnabled);
+  document.getElementById('ctrl-ns').classList.toggle('active', settings.nsEnabled);
+  isNoiseSuppression = settings.nsEnabled;
+
+  // Update NS toggle in modal
+  const nsChk = document.getElementById('set-ns-enabled');
+  if (nsChk) nsChk.checked = settings.nsEnabled;
+
+  // Echo cancellation — applies on reconnect
+  const ecChk = document.getElementById('set-echo-cancellation');
+  if (ecChk) ecChk.checked = settings.echoCancellation;
+
+  // VAD threshold
+  const vadChk = document.getElementById('set-vad-threshold');
+  const vadVal = document.getElementById('set-vad-threshold-val');
+  if (vadChk) vadChk.value = settings.vadThreshold;
+  if (vadVal) vadVal.textContent = settings.vadThreshold;
+
+  // Input gain slider
+  const gainSlider = document.getElementById('set-input-gain');
+  const gainVal = document.getElementById('set-input-gain-val');
+  if (gainSlider) gainSlider.value = settings.inputGain;
+  if (gainVal) gainVal.textContent = settings.inputGain + '%';
+
+  // PTT
+  const pttChk = document.getElementById('set-ptt-enabled');
+  const pttKeyRow = document.getElementById('set-ptt-key-row');
+  if (pttChk) pttChk.checked = settings.pttEnabled;
+  if (pttKeyRow) pttKeyRow.style.display = settings.pttEnabled ? 'flex' : 'none';
+  updatePTTKeyLabel();
+
+  // Video
+  const resSel = document.getElementById('set-video-res');
+  const fpsSel = document.getElementById('set-video-fps');
+  if (resSel) resSel.value = settings.videoRes;
+  if (fpsSel) fpsSel.value = settings.videoFps;
+
+  // Peer volumes
+  applyPeerVolumes();
+}
+
+function applyPeerVolumes() {
+  peers.forEach((peer, id) => {
+    if (!peer.audioEl) return;
+    const vol = settings.peerVolumes[id] ?? 100;
+    peer.audioEl.volume = vol / 100;
+  });
+}
+
+function renderPeerVolumeSliders() {
+  const container = document.getElementById('set-peer-volumes');
+  if (!container) return;
+  container.innerHTML = '';
+
+  peers.forEach((peer, id) => {
+    const vol = settings.peerVolumes[id] ?? 100;
+    const row = document.createElement('div');
+    row.className = 'peer-vol-row';
+    row.innerHTML = `
+      <span class="peer-vol-name">${esc(peer.name)}</span>
+      <input type="range" min="0" max="200" value="${vol}" class="settings-slider peer-vol-slider" data-peer-id="${id}"/>
+      <span class="settings-value">${vol}%</span>
+    `;
+    const slider = row.querySelector('.settings-slider');
+    const valEl = row.querySelector('.settings-value');
+    slider.addEventListener('input', () => {
+      const v = parseInt(slider.value);
+      valEl.textContent = v + '%';
+      settings.peerVolumes[id] = v;
+      if (peer.audioEl) peer.audioEl.volume = v / 100;
+      saveSettings();
+    });
+    container.appendChild(row);
+  });
+}
+
+// ── Settings Modal ────────────────────────────────────────────────────────────
+document.getElementById('ctrl-settings').addEventListener('click', async () => {
+  document.getElementById('modal-settings').style.display = 'flex';
+  await enumerateAudioDevices();
+  renderPeerVolumeSliders();
+  applySettings();
+});
+
+document.getElementById('settings-close').addEventListener('click', () => {
+  document.getElementById('modal-settings').style.display = 'none';
+});
+
+// Close on backdrop click
+document.getElementById('modal-settings').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('modal-settings')) {
+    document.getElementById('modal-settings').style.display = 'none';
+  }
+});
+
+// ── Device Enumeration ────────────────────────────────────────────────────────
+async function enumerateAudioDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const micSelect = document.getElementById('set-mic-device');
+    const outSelect = document.getElementById('set-output-device');
+
+    const mics = devices.filter(d => d.kind === 'audioinput');
+    const outputs = devices.filter(d => d.kind === 'audiooutput');
+
+    micSelect.innerHTML = mics.length === 0
+      ? '<option value="">No microphones found</option>'
+      : mics.map(d => `<option value="${esc(d.deviceId)}" ${d.deviceId === settings.micDeviceId ? 'selected' : ''}>${esc(d.label || 'Microphone')}</option>`).join('');
+
+    outSelect.innerHTML = outputs.length === 0
+      ? '<option value="">No output devices found</option>'
+      : outputs.map(d => `<option value="${esc(d.deviceId)}" ${d.deviceId === settings.outputDeviceId ? 'selected' : ''}>${esc(d.label || 'Speaker')}</option>`).join('');
+  } catch (e) {
+    console.warn('[settings] enumerateDevices failed:', e);
+  }
+}
+
+// ── Settings Change Handlers ──────────────────────────────────────────────────
+document.getElementById('set-mic-device').addEventListener('change', async (e) => {
+  settings.micDeviceId = e.target.value;
+  saveSettings();
+  if (localStream) {
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: settings.micDeviceId ? { exact: settings.micDeviceId } : undefined,
+          echoCancellation: settings.echoCancellation,
+          noiseSuppression: false,
+          autoGainControl: true,
+          sampleRate: 48000,
+          channelCount: 1,
+        },
+        video: false,
+      });
+      const newAudioTrack = newStream.getAudioTracks()[0];
+      if (newAudioTrack) {
+        // Stop OLD raw mic (not the processed destination stream!)
+        if (rawMicStream) {
+          rawMicStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+        }
+        rawMicStream = newStream;
+        let processedStream = newStream;
+        if (noiseSuppressor && noiseSuppressor.initialized) {
+          try {
+            processedStream = noiseSuppressor.processStream('self', newStream);
+            noiseSuppressor.setGain(settings.inputGain / 100);
+          } catch (err) {
+            console.warn('[voxlink] noise suppression failed for new mic:', err);
+          }
+        }
+        localStream = processedStream;
+        // Update all peer connections
+        const finalTrack = localStream.getAudioTracks()[0];
+        if (finalTrack) {
+          peers.forEach(peer => {
+            if (!peer.pc) return;
+            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'audio');
+            if (sender) sender.replaceTrack(finalTrack);
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('[settings] mic switch failed:', err);
+    }
+  }
+});
+
+document.getElementById('set-output-device').addEventListener('change', async (e) => {
+  settings.outputDeviceId = e.target.value;
+  saveSettings();
+  // Apply to all peer audio elements
+  try {
+    peers.forEach(peer => {
+      if (peer.audioEl && typeof peer.audioEl.setSinkId === 'function') {
+        peer.audioEl.setSinkId(settings.outputDeviceId).catch(() => {});
+      }
+    });
+  } catch {}
+});
+
+document.getElementById('set-input-gain').addEventListener('input', (e) => {
+  settings.inputGain = parseInt(e.target.value);
+  document.getElementById('set-input-gain-val').textContent = settings.inputGain + '%';
+  applyInputGain();
+  saveSettings();
+});
+
+document.getElementById('set-vad-threshold').addEventListener('input', (e) => {
+  settings.vadThreshold = parseInt(e.target.value);
+  document.getElementById('set-vad-threshold-val').textContent = settings.vadThreshold;
+  saveSettings();
+});
+
+document.getElementById('set-ns-enabled').addEventListener('change', (e) => {
+  settings.nsEnabled = e.target.checked;
+  saveSettings();
+  applySettings();
+  // Toggle bypass on the local mic graph — no stream re-processing needed
+  if (noiseSuppressor) {
+    noiseSuppressor.setEnabled(settings.nsEnabled);
+  }
+});
+
+document.getElementById('set-echo-cancellation').addEventListener('change', (e) => {
+  settings.echoCancellation = e.target.checked;
+  saveSettings();
+  // Will take effect on next mic acquisition
+});
+
+document.getElementById('set-ptt-enabled').addEventListener('change', (e) => {
+  settings.pttEnabled = e.target.checked;
+  document.getElementById('set-ptt-key-row').style.display = settings.pttEnabled ? 'flex' : 'none';
+  saveSettings();
+  if (!settings.pttEnabled) {
+    // Unmute if PTT disabled while muted
+    if (isMuted) {
+      isMuted = false;
+      localStream.getAudioTracks().forEach(t => t.enabled = true);
+      document.getElementById('ctrl-mute').classList.remove('danger');
+      document.getElementById('vc-me')?.classList.remove('muted-card');
+      send({ type: 'mute', muted: false });
+      renderPeers();
+    }
+  }
+});
+
+// PTT key capture
+document.getElementById('set-ptt-key-btn').addEventListener('click', () => {
+  const btn = document.getElementById('set-ptt-key-btn');
+  if (pttListening) return;
+  pttListening = true;
+  btn.textContent = 'Press a key...';
+  btn.classList.add('listening');
+
+  function onKey(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    settings.pttKey = e.code;
+    saveSettings();
+    updatePTTKeyLabel();
+    pttListening = false;
+    btn.classList.remove('listening');
+    document.removeEventListener('keydown', onKey, true);
+  }
+  document.addEventListener('keydown', onKey, true);
+});
+
+function updatePTTKeyLabel() {
+  const btn = document.getElementById('set-ptt-key-btn');
+  if (!btn) return;
+  if (!settings.pttKey) {
+    btn.textContent = 'Press a key...';
+  } else {
+    // Pretty print key name
+    const key = settings.pttKey
+      .replace('Key', '')
+      .replace('Digit', '')
+      .replace('Arrow', '↑↓←→'.includes(settings.pttKey.slice(-1)) ? settings.pttKey : 'Arrow ')
+      .replace('Space', 'Space');
+    btn.textContent = key || settings.pttKey;
+  }
+}
+
+// PTT global key handlers
+document.addEventListener('keydown', (e) => {
+  if (!settings.pttEnabled || !settings.pttKey || pttListening) return;
+  if (e.code === settings.pttKey && !e.repeat) {
+    e.preventDefault();
+    pttPressed = true;
+    if (isMuted) {
+      isMuted = false;
+      localStream.getAudioTracks().forEach(t => t.enabled = true);
+      document.getElementById('ctrl-mute').classList.remove('danger');
+      document.getElementById('vc-me')?.classList.remove('muted-card');
+      send({ type: 'mute', muted: false });
+      renderPeers();
+    }
+  }
+});
+
+document.addEventListener('keyup', (e) => {
+  if (!settings.pttEnabled || !settings.pttKey) return;
+  if (e.code === settings.pttKey) {
+    e.preventDefault();
+    pttPressed = false;
+    if (!isMuted) {
+      isMuted = true;
+      localStream.getAudioTracks().forEach(t => t.enabled = false);
+      document.getElementById('ctrl-mute').classList.add('danger');
+      document.getElementById('vc-me')?.classList.add('muted-card');
+      send({ type: 'mute', muted: true });
+      renderPeers();
+    }
+  }
+});
+
+// ── Input Gain ────────────────────────────────────────────────────────────────
+function applyInputGain() {
+  if (noiseSuppressor) {
+    noiseSuppressor.setGain(settings.inputGain / 100);
+  }
+}
+
+// ── Video Quality Helper ──────────────────────────────────────────────────────
+function getVideoConstraints() {
+  const [w, h] = settings.videoRes.split('x').map(Number);
+  const fps = parseInt(settings.videoFps) || 30;
+  return {
+    mandatory: {
+      chromeMediaSource: 'desktop',
+      chromeMediaSourceId: window._selectedSourceId,
+      minWidth: Math.min(w, 640),
+      maxWidth: w,
+      minHeight: Math.min(h, 360),
+      maxHeight: h,
+      minFrameRate: Math.min(fps, 10),
+      maxFrameRate: fps,
+    }
+  };
+}
+
+// ── Context Menu (right-click volume) ────────────────────────────────────────
+let ctxTargetPeerId = null;
+
+function showCtxMenu(x, y, peerId, name) {
+  ctxTargetPeerId = peerId;
+  const menu = document.getElementById('ctx-menu');
+  const title = document.getElementById('ctx-title');
+  const slider = document.getElementById('ctx-volume');
+  const valEl = document.getElementById('ctx-volume-val');
+
+  title.textContent = name;
+  const vol = settings.peerVolumes[peerId] ?? 100;
+  slider.value = vol;
+  valEl.textContent = vol + '%';
+
+  // Position menu, keeping it on-screen
+  menu.style.display = 'block';
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = Math.min(x, window.innerWidth - rect.width - 8) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - rect.height - 8) + 'px';
+}
+
+function hideCtxMenu() {
+  document.getElementById('ctx-menu').style.display = 'none';
+  ctxTargetPeerId = null;
+}
+
+document.getElementById('ctx-volume').addEventListener('input', (e) => {
+  if (!ctxTargetPeerId) return;
+  const vol = parseInt(e.target.value);
+  document.getElementById('ctx-volume-val').textContent = vol + '%';
+
+  // Check if we're controlling screen share volume
+  const menuTitle = document.getElementById('ctx-title').textContent;
+  if (menuTitle.includes('(screen)')) {
+    const video = document.getElementById('share-video');
+    video.volume = vol / 100;
+  } else {
+    settings.peerVolumes[ctxTargetPeerId] = vol;
+    const peer = peers.get(ctxTargetPeerId);
+    if (peer?.audioEl) peer.audioEl.volume = vol / 100;
+    saveSettings();
+  }
+});
+
+// Close on click outside
+document.addEventListener('click', (e) => {
+  if (!document.getElementById('ctx-menu').contains(e.target)) {
+    hideCtxMenu();
+  }
+});
+document.addEventListener('contextmenu', (e) => {
+  if (!document.getElementById('ctx-menu').contains(e.target)) {
+    hideCtxMenu();
+  }
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────────
+loadSettings();
+applySettings();
 document.getElementById('inp-name').focus();
