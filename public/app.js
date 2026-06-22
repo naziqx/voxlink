@@ -912,88 +912,95 @@ async function startScreenShare(sourceId, shareAudio = false) {
   // Don't mute peers on the sharer's side - sharer should hear everyone
 
   try {
-    // Step 1: get video via Electron desktopCapturer (our custom picker sourceId)
-    const videoStream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: getVideoConstraints(),
-    });
+    const isLinux = navigator.userAgent.includes('Linux');
+    let videoStream, audioStream = null;
 
-    if (shareAudio) {
-      const isLinux = navigator.userAgent.includes('Linux');
-      let audioStream = null;
-
-      if (isLinux && window.pipewire) {
-        // Linux: use PipeWire virtual sink to capture system audio excluding our app
-        try {
-          const pw = await window.pipewire.start();
-          if (pw.ok) {
-            console.log('[voxlink] PipeWire sink ready:', pw.sinkName);
-
-            // Wait for PipeWire to register the monitor as audio input device
-            await new Promise(r => setTimeout(r, 500));
-
-            // Find voxlink_mic virtual source in audio input devices
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const micDevice = devices.find(d =>
-              d.kind === 'audioinput' && d.label.toLowerCase().includes('voxlink')
-            );
-            console.log('[voxlink] voxlink_mic device:', micDevice?.label, micDevice?.deviceId);
-
-            if (micDevice) {
-              const pwStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                  deviceId: { exact: micDevice.deviceId },
-                  echoCancellation: false,
-                  noiseSuppression: false,
-                  autoGainControl: false,
-                },
-                video: false,
-              }).catch(e => { console.warn('[voxlink] voxlink_mic capture failed:', e.message); return null; });
-
-              if (pwStream) {
-                audioStream = pwStream;
-                console.log('[voxlink] voxlink_mic captured, tracks:', pwStream.getAudioTracks().length);
-              }
-            } else {
-              console.warn('[voxlink] voxlink_mic not found in devices');
-            }
-          }
-        } catch(e) {
-          console.warn('[voxlink] PipeWire setup failed:', e.message);
-        }
-      } else if (window.audioLoopback) {
-        // Windows: use electron-audio-loopback with improved quality
-        try {
-          await window.audioLoopback.enable();
-          const loopbackStream = await navigator.mediaDevices.getDisplayMedia({
-            video: true,
-            audio: {
-              echoCancellation: false,
-              noiseSuppression: false,
-              autoGainControl: false,
-              sampleRate: 48000,
-              channelCount: 2,
-              latency: { ideal: 0.01 },
-            },
-          });
-          loopbackStream.getVideoTracks().forEach(t => { t.stop(); loopbackStream.removeTrack(t); });
-          audioStream = loopbackStream;
-          console.log('[voxlink] Windows loopback audio tracks:', loopbackStream.getAudioTracks().length);
-        } catch(e) {
-          console.warn('[voxlink] Windows loopback failed:', e.message);
-        }
-      }
-
-      if (audioStream && audioStream.getAudioTracks().length > 0) {
-        screenStream = new MediaStream([
-          ...videoStream.getVideoTracks(),
-          ...audioStream.getAudioTracks(),
-        ]);
-      } else {
-        console.warn('[voxlink] no audio captured, video only');
-        screenStream = videoStream;
+    if (shareAudio && !isLinux && window.audioLoopback) {
+      // Windows with audio: single getDisplayMedia for video + loopback audio
+      // Two separate captures (getUserMedia + getDisplayMedia) conflict on Windows
+      try {
+        await window.audioLoopback.enable();
+        await new Promise(r => setTimeout(r, 300));
+        const combined = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            sampleRate: 48000,
+            channelCount: 2,
+          },
+        });
+        videoStream = new MediaStream(combined.getVideoTracks());
+        audioStream = new MediaStream(combined.getAudioTracks());
+        console.log('[voxlink] Windows combined capture, video tracks:', videoStream.getVideoTracks().length, 'audio tracks:', audioStream.getAudioTracks().length);
+      } catch(e) {
+        console.warn('[voxlink] Windows combined capture failed, falling back to video-only:', e.message);
+        videoStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: getVideoConstraints(),
+        });
       }
     } else {
+      // Linux or no audio: get video via Electron desktopCapturer
+      videoStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: getVideoConstraints(),
+      });
+    }
+
+    if (shareAudio && isLinux && window.pipewire) {
+      // Linux: use PipeWire virtual sink to capture system audio excluding our app
+      try {
+        const pw = await window.pipewire.start();
+        if (pw.ok) {
+          console.log('[voxlink] PipeWire sink ready:', pw.sinkName);
+
+          await new Promise(r => setTimeout(r, 500));
+
+          let micDevice = null;
+          for (let attempt = 0; attempt < 5; attempt++) {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            micDevice = devices.find(d =>
+              d.kind === 'audioinput' && d.label.toLowerCase().includes('voxlink')
+            );
+            if (micDevice) break;
+            console.log(`[voxlink] voxlink_mic not found, retry ${attempt + 1}/5...`);
+            await new Promise(r => setTimeout(r, 600));
+          }
+          console.log('[voxlink] voxlink_mic device:', micDevice?.label, micDevice?.deviceId);
+
+          if (micDevice) {
+            const pwStream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                deviceId: { exact: micDevice.deviceId },
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+              },
+              video: false,
+            }).catch(e => { console.warn('[voxlink] voxlink_mic capture failed:', e.message); return null; });
+
+            if (pwStream) {
+              audioStream = pwStream;
+              console.log('[voxlink] voxlink_mic captured, tracks:', pwStream.getAudioTracks().length);
+            }
+          } else {
+            console.warn('[voxlink] voxlink_mic not found in devices');
+          }
+        }
+      } catch(e) {
+        console.warn('[voxlink] PipeWire setup failed:', e.message);
+      }
+    }
+
+    if (audioStream && audioStream.getAudioTracks().length > 0) {
+      screenStream = new MediaStream([
+        ...videoStream.getVideoTracks(),
+        ...audioStream.getAudioTracks(),
+      ]);
+    } else {
+      console.warn('[voxlink] no audio captured, video only');
       screenStream = videoStream;
     }
 
@@ -1002,10 +1009,9 @@ async function startScreenShare(sourceId, shareAudio = false) {
     return;
   }
   if (screenStream.getAudioTracks().length > 0) {
-    console.log('[voxlink] system audio will be shared');
-    // Keep peers muted - their voice comes through screen audio
+    console.log('[voxlink] system audio will be shared — muting peers to prevent loopback echo');
+    peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = true; });
   } else {
-    // No screen audio - restore peer mic audio immediately
     console.log('[voxlink] no screen audio, restoring peer audio');
     peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = isDeafened; });
   }
