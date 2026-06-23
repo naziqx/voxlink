@@ -11,7 +11,8 @@ contextBridge.exposeInMainWorld('voxlink', {
 // expose loopback control
 const { ipcRenderer: ipc2 } = require('electron');
 contextBridge.exposeInMainWorld('audioLoopback', {
-  enable: () => ipc2.invoke('enable-loopback'),
+  enable:  () => ipc2.invoke('enable-loopback'),
+  disable: () => ipc2.invoke('disable-loopback'),
 });
 
 contextBridge.exposeInMainWorld('pipewire', {

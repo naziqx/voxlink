@@ -18,7 +18,6 @@ if (process.platform === 'linux') {
   app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
   // Allow PipeWire monitor sinks to appear as audio input devices
   app.commandLine.appendSwitch('enable-webrtc-pipewire-capturer');
-  app.commandLine.appendSwitch('auto-select-desktop-capture-source', 'voxlink_capture');
 }
 
 let mainWindow;
@@ -503,6 +502,24 @@ ipcMain.handle('enable-loopback', async () => {
     audioLoopbackInitialized = true;
     return { ok: true };
   } catch(e) {
+    return { ok: false, reason: e.message };
+  }
+});
+
+ipcMain.handle('disable-loopback', async () => {
+  if (!audioLoopback || !audioLoopbackInitialized) return { ok: true };
+  try {
+    if (typeof audioLoopback.cleanup === 'function') {
+      audioLoopback.cleanup();
+    } else if (typeof audioLoopback.destroy === 'function') {
+      audioLoopback.destroy();
+    }
+    audioLoopbackInitialized = false;
+    console.log('[main] audioLoopback cleaned up');
+    return { ok: true };
+  } catch(e) {
+    console.warn('[main] audioLoopback cleanup failed:', e.message);
+    audioLoopbackInitialized = false;
     return { ok: false, reason: e.message };
   }
 });

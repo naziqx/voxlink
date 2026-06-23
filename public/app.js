@@ -1009,11 +1009,7 @@ async function startScreenShare(sourceId, shareAudio = false) {
     return;
   }
   if (screenStream.getAudioTracks().length > 0) {
-    console.log('[voxlink] system audio will be shared — muting peers to prevent loopback echo');
-    peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = true; });
-  } else {
-    console.log('[voxlink] no screen audio, restoring peer audio');
-    peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = isDeafened; });
+    console.log('[voxlink] screen audio will be shared — peers kept audible (PipeWire/loopback isolates app audio)');
   }
     // Tell encoder this is screen content (sharp text), not motion video
     setContentHint(screenStream);
@@ -1093,6 +1089,16 @@ async function stopScreenShare() {
         try { peer.pc.removeTrack(sender); } catch (e) {}
       }
     });
+    // Renegotiate so remote side detects track removal
+    if (peer.pc.signalingState === 'stable') {
+      peer.pc.createOffer().then(offer => {
+        return peer.pc.setLocalDescription(offer);
+      }).then(() => {
+        for (const [id, p] of peers) {
+          if (p === peer) { send({ type: 'offer', to: id, sdp: peer.pc.localDescription }); break; }
+        }
+      }).catch(e => console.warn('[voxlink] renegotiate after removeTrack failed:', e.message));
+    }
   });
 
   screenStream?.getTracks().forEach(t => t.stop());
@@ -1101,6 +1107,11 @@ async function stopScreenShare() {
   // Teardown PipeWire virtual sink on Linux
   if (window.pipewire) {
     await window.pipewire.stop().catch(e => console.warn('[voxlink] pipewire stop:', e.message));
+  }
+
+  // Cleanup audio loopback on Windows so audio routing is restored
+  if (window.audioLoopback) {
+    await window.audioLoopback.disable().catch(e => console.warn('[voxlink] loopback disable:', e.message));
   }
 
   // Restore peer audio in case deafen was on
