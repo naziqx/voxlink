@@ -366,8 +366,11 @@ async function handleSignal(msg) {
         video.srcObject = null;
         document.getElementById('share-viewer').style.display = 'none';
         document.getElementById('ctrl-back-voice').style.display = 'none';
-        // Restore peer mic audio
-        peers.forEach(p => { if (p.audioEl) p.audioEl.muted = isDeafened; });
+        // Restore the screen-sharing peer's audio
+        if (peer?.audioEl) {
+          peer.audioEl.muted = isDeafened;
+          peer.audioEl.volume = (settings.peerVolumes[msg.from] || 100) / 100;
+        }
       }
       break;
     }
@@ -416,16 +419,18 @@ function createPC(peerId) {
       updateCardLabel(peerId);
       showSharedScreen(stream, peer.name, peerId);
 
-      // Apply any buffered audio tracks — reclassify using screenAudioTrackId
+      // Apply any buffered audio tracks — reclassify using screenAudioTrackId and screenAudioStreamId
       if (peer.pendingScreenAudio) {
         const screenAudio = [];
         const micAudio = [];
-        peer.pendingScreenAudio.forEach(audioTrack => {
-          // Use track ID from screen_start signal (track.streams is unreliable in WebRTC)
-          if (peer.screenAudioTrackId && audioTrack.id === peer.screenAudioTrackId) {
-            screenAudio.push(audioTrack);
+        peer.pendingScreenAudio.forEach(entry => {
+          const t = entry.track || entry;
+          const sId = entry.streamId || null;
+          if ((peer.screenAudioTrackId && t.id === peer.screenAudioTrackId) ||
+              (peer.screenAudioStreamId && sId === peer.screenAudioStreamId)) {
+            screenAudio.push(t);
           } else {
-            micAudio.push(audioTrack);
+            micAudio.push(t);
           }
         });
         // Add screen audio to the screen stream
@@ -473,7 +478,7 @@ function createPC(peerId) {
       // buffer this audio — we'll reclassify when video arrives
       if (!isScreenAudio && peer.sharingScreen && !peer.screenStream && !peer.stream) {
         if (!peer.pendingScreenAudio) peer.pendingScreenAudio = [];
-        peer.pendingScreenAudio.push(track);
+        peer.pendingScreenAudio.push({ track, streamId: stream.id });
         console.log('[voxlink] buffering audio for late-join screen share');
         return;
       }
@@ -494,7 +499,7 @@ function createPC(peerId) {
         } else {
           // Video not arrived yet — buffer
           if (!peer.pendingScreenAudio) peer.pendingScreenAudio = [];
-          peer.pendingScreenAudio.push(track);
+          peer.pendingScreenAudio.push({ track, streamId: stream.id });
           console.log('[voxlink] screen audio buffered (waiting for video)');
         }
         return;
@@ -708,8 +713,11 @@ function switchToScreen(peerId) {
     document.getElementById('share-viewer').style.display = 'none';
     document.getElementById('ctrl-back-voice').style.display = 'none';
     document.querySelectorAll('.voice-card').forEach(c => c.classList.remove('viewing-screen'));
-    // Restore peer mic audio
-    peers.forEach(p => { if (p.audioEl) p.audioEl.muted = isDeafened; });
+    // Restore the screen-sharing peer's audio
+    if (peer?.audioEl) {
+      peer.audioEl.muted = isDeafened;
+      peer.audioEl.volume = (settings.peerVolumes[peerId] || 100) / 100;
+    }
     return;
   }
 
@@ -916,8 +924,11 @@ async function startScreenShare(sourceId, shareAudio = false) {
     let videoStream, audioStream = null;
 
     if (shareAudio && !isLinux && window.audioLoopback) {
-      // Windows with audio: single getDisplayMedia for video + loopback audio
-      // Two separate captures (getUserMedia + getDisplayMedia) conflict on Windows
+      // Windows with audio: isolate VoxLink's audio from loopback via WASAPI
+      if (window.wasapiIsolate) {
+        const iso = await window.wasapiIsolate.start();
+        console.log('[voxlink] WASAPI isolation started:', iso);
+      }
       try {
         await window.audioLoopback.enable();
         await new Promise(r => setTimeout(r, 300));
@@ -1114,6 +1125,11 @@ async function stopScreenShare() {
     await window.audioLoopback.disable().catch(e => console.warn('[voxlink] loopback disable:', e.message));
   }
 
+  // Restore VoxLink's audio sessions on Windows
+  if (window.wasapiIsolate) {
+    await window.wasapiIsolate.stop().catch(e => console.warn('[voxlink] WASAPI unmute failed:', e.message));
+  }
+
   // Restore peer audio in case deafen was on
   peers.forEach(peer => { if (peer.audioEl) peer.audioEl.muted = isDeafened; });
 
@@ -1230,9 +1246,9 @@ function closeScreenViewer() {
   document.querySelectorAll('.voice-card').forEach(c => c.classList.remove('viewing-screen'));
   document.getElementById('share-viewer').style.display = 'none';
   document.getElementById('ctrl-back-voice').style.display = 'none';
-  // Restore peer mic audio (unless user has deafen on)
   peers.forEach(peer => {
     if (peer.audioEl) peer.audioEl.muted = isDeafened;
+    if (peer.audioEl) peer.audioEl.volume = (settings.peerVolumes[ctxTargetPeerId] || 100) / 100;
   });
 }
 
@@ -1245,6 +1261,9 @@ function showSharedScreen(stream, peerName, peerId) {
   document.getElementById('share-bar-label').textContent = `${peerName} is sharing their screen`;
   document.getElementById('share-viewer').style.display = 'flex';
   document.getElementById('ctrl-back-voice').style.display = 'flex';
+  // Mute peer's audioEl while viewing their screen (audio plays via share-video)
+  const peer = peers.get(peerId);
+  if (peer?.audioEl) peer.audioEl.muted = true;
 }
 
 // ── Room UI init ──────────────────────────────────────────────────────────────
@@ -1649,14 +1668,15 @@ function hideCtxMenu() {
 
 document.getElementById('ctx-volume').addEventListener('input', (e) => {
   if (!ctxTargetPeerId) return;
-  const vol = parseInt(e.target.value);
+  const vol = Math.min(parseInt(e.target.value), 100);
   document.getElementById('ctx-volume-val').textContent = vol + '%';
 
-  // Check if we're controlling screen share volume
   const menuTitle = document.getElementById('ctx-title').textContent;
   if (menuTitle.includes('(screen)')) {
     const video = document.getElementById('share-video');
     video.volume = vol / 100;
+    const peer = peers.get(ctxTargetPeerId);
+    if (peer?.audioEl) peer.audioEl.volume = vol / 100;
   } else {
     settings.peerVolumes[ctxTargetPeerId] = vol;
     const peer = peers.get(ctxTargetPeerId);

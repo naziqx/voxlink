@@ -19,3 +19,9 @@ contextBridge.exposeInMainWorld('pipewire', {
   start: () => ipc2.invoke('pipewire-start'),
   stop:  () => ipc2.invoke('pipewire-stop'),
 });
+
+contextBridge.exposeInMainWorld('wasapiIsolate', {
+  start:  () => ipc2.invoke('wasapi-isolate-start'),
+  stop:   () => ipc2.invoke('wasapi-isolate-stop'),
+  sessions: () => ipc2.invoke('wasapi-get-sessions'),
+});

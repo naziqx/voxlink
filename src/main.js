@@ -7,6 +7,15 @@ try {
 } catch(e) {
   console.warn('[main] electron-audio-loopback not available:', e.message);
 }
+let wasapiAddon = null;
+if (process.platform === 'win32') {
+  try {
+    wasapiAddon = require('./wasapi/build/Release/wasapi_audio.node');
+    console.log('[main] WASAPI addon loaded');
+  } catch(e) {
+    console.warn('[main] WASAPI addon not available:', e.message);
+  }
+}
 const { WebSocketServer, WebSocket } = require('ws');
 const path = require('path');
 const os = require('os');
@@ -531,6 +540,62 @@ ipcMain.handle('pipewire-start', async () => {
 ipcMain.handle('pipewire-stop', async () => {
   await teardownPipeWireCapture();
   return { ok: true };
+});
+
+// ── Windows WASAPI Audio Isolation ──────────────────────────────────────────
+let wasapiAddon = null;
+if (process.platform === 'win32') {
+  try {
+    wasapiAddon = require('./wasapi/build/Release/wasapi_audio.node');
+    console.log('[main] WASAPI capture addon loaded');
+  } catch (e) {
+    console.warn('[main] WASAPI capture addon not available:', e.message);
+  }
+}
+
+let wasapiMutedPids = [];
+
+ipcMain.handle('wasapi-isolate-start', async () => {
+  if (!wasapiAddon) return { ok: false, reason: 'WASAPI addon not available' };
+  try {
+    const myPid = wasapiAddon.getCurrentPid();
+    const sessions = wasapiAddon.enumerateSessions();
+    const mySessions = sessions.filter(s => s.pid === myPid && !s.isMuted);
+    for (const s of mySessions) {
+      wasapiAddon.muteSessionByPid(s.pid, true);
+      wasapiMutedPids.push(s.pid);
+      console.log('[wasapi] muted session pid:', s.pid, 'name:', s.name);
+    }
+    return { ok: true, muted: mySessions.length };
+  } catch (e) {
+    console.warn('[wasapi] isolate start failed:', e.message);
+    return { ok: false, reason: e.message };
+  }
+});
+
+ipcMain.handle('wasapi-isolate-stop', async () => {
+  if (!wasapiAddon) return { ok: true };
+  try {
+    for (const pid of wasapiMutedPids) {
+      wasapiAddon.muteSessionByPid(pid, false);
+      console.log('[wasapi] unmuted pid:', pid);
+    }
+    wasapiMutedPids = [];
+    return { ok: true };
+  } catch (e) {
+    console.warn('[wasapi] isolate stop failed:', e.message);
+    wasapiMutedPids = [];
+    return { ok: false, reason: e.message };
+  }
+});
+
+ipcMain.handle('wasapi-get-sessions', async () => {
+  if (!wasapiAddon) return { sessions: [] };
+  try {
+    return { sessions: wasapiAddon.enumerateSessions() };
+  } catch (e) {
+    return { sessions: [] };
+  }
 });
 
 ipcMain.handle('show-notification', (_, { title, body }) => {
