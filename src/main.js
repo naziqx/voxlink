@@ -7,15 +7,6 @@ try {
 } catch(e) {
   console.warn('[main] electron-audio-loopback not available:', e.message);
 }
-let wasapiAddon = null;
-if (process.platform === 'win32') {
-  try {
-    wasapiAddon = require('./wasapi/build/Release/wasapi_audio.node');
-    console.log('[main] WASAPI addon loaded');
-  } catch(e) {
-    console.warn('[main] WASAPI addon not available:', e.message);
-  }
-}
 const { WebSocketServer, WebSocket } = require('ws');
 const path = require('path');
 const os = require('os');
